@@ -565,55 +565,75 @@ mod tests {
             .is_empty()
         );
 
-        let frame = match crate::render_rgba(
+        let Some(frame) = colours(crate::render_rgba(
             &grid,
             Size {
                 width: 512,
                 height: 288,
             },
-        ) {
-            Ok(frame) => frame,
-            Err(err) => {
-                eprintln!("{err}");
-                return;
-            }
+        )) else {
+            return;
         };
-        assert_eq!(pixel(&frame, 512, 0, 0), [0x10, 0x20, 0x30, 0xFF]);
-        assert_eq!(pixel(&frame, 512, 1, 0), [0x00, 0x00, 0x00, 0xFF]);
+        asserted(512, 288, &frame, 0, 0, [0x10, 0x20, 0x30, 0xFF]);
+        asserted(512, 288, &frame, 1, 0, [0x00, 0x00, 0x00, 0xFF]);
 
-        let frame = match crate::render_rgba(
+        let Some(frame) = colours(crate::render_rgba(
             &grid,
             Size {
                 width: 1024,
                 height: 600,
             },
-        ) {
-            Ok(frame) => frame,
-            Err(err) => {
-                eprintln!("{err}");
-                return;
-            }
+        )) else {
+            return;
         };
-        assert_eq!(pixel(&frame, 1024, 0, 0), [20, 20, 23, 255]);
-        assert_eq!(pixel(&frame, 1024, 0, 11), [20, 20, 23, 255]);
-        assert_eq!(pixel(&frame, 1024, 0, 12), [0x10, 0x20, 0x30, 0xFF]);
+        asserted(1024, 600, &frame, 0, 0, [20, 20, 23, 255]);
+        asserted(1024, 600, &frame, 0, 11, [20, 20, 23, 255]);
+        asserted(1024, 600, &frame, 0, 12, [0x10, 0x20, 0x30, 0xFF]);
 
-        let frame = match crate::render_rgba(
+        let Some(frame) = colours(crate::render_rgba(
             &grid,
             Size {
                 width: 400,
                 height: 200,
             },
-        ) {
-            Ok(frame) => frame,
-            Err(err) => {
-                eprintln!("{err}");
-                return;
-            }
+        )) else {
+            return;
         };
         assert_eq!(frame.len(), 400 * 200 * 4);
-        assert_eq!(pixel(&frame, 400, 0, 0), [0x01, 0x02, 0x03, 0xFF]);
-        assert_eq!(pixel(&frame, 400, 0, 1), [0x10, 0x20, 0x30, 0xFF]);
+        eprintln!("asserted 400x200 byte length = {}", frame.len());
+        asserted(400, 200, &frame, 0, 0, [0x01, 0x02, 0x03, 0xFF]);
+        asserted(400, 200, &frame, 0, 1, [0x10, 0x20, 0x30, 0xFF]);
+    }
+
+    fn colours(result: Result<Vec<u8>, crate::NoAdapter>) -> Option<Vec<u8>> {
+        match result {
+            Ok(frame) => Some(frame),
+            Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
+                panic!("GRAINS_REQUIRE_GPU=1 and no adapter was found: {err}")
+            }
+            Err(err) => {
+                eprintln!("offscreen colour asserts skipped: {err}");
+                None
+            }
+        }
+    }
+
+    fn asserted(width: u32, height: u32, frame: &[u8], x: u32, y: u32, expect: [u8; 4]) {
+        let got = pixel(frame, width, x, y);
+        assert_eq!(got, expect);
+        eprintln!("asserted {width}x{height} pixel ({x},{y}) = {got:?}");
+    }
+
+    #[test]
+    fn gpu_required_is_only_the_digit_one() {
+        assert!(!gpu_required(None));
+        assert!(!gpu_required(Some("")));
+        assert!(!gpu_required(Some("0")));
+        assert!(gpu_required(Some("1")));
+    }
+
+    fn gpu_required(value: Option<&str>) -> bool {
+        value == Some("1")
     }
 
     fn pixel(frame: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {

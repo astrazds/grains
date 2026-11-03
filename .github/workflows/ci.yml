@@ -10,8 +10,26 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Linux is pinned to lavapipe below. Windows keeps the software-flagged
+    # WARP adapter that DXGI already exposes, so this job does not install one.
+    env:
+      GRAINS_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Install lavapipe
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          icd=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -n 1)
+          if [ -z "$icd" ]; then
+            echo "lavapipe ICD missing"
+            find /usr -name 'lvp_icd*.json' -o -name '*icd*.json' | head
+            exit 1
+          fi
+          echo "Using lavapipe ICD $icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       - name: Read the pinned toolchain
         id: rust
         shell: bash
@@ -29,7 +47,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - name: Test
+        run: cargo test --locked -- --nocapture
       - run: cargo build --locked
       - name: Wasm
         if: runner.os == 'Linux'
