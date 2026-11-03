@@ -46,12 +46,39 @@ pub(crate) struct Gpu {
     // Bind groups borrow this buffer. The field keeps it alive.
     #[allow(dead_code)]
     reactions: wgpu::Buffer,
+    // Bind groups borrow these buffers. The fields keep them alive.
+    #[allow(dead_code)]
+    particles: wgpu::Buffer,
+    #[allow(dead_code)]
+    claims: wgpu::Buffer,
+    blast_groups: [wgpu::BindGroup; 2],
+    blast_pipeline: wgpu::ComputePipeline,
+    fly_pipeline: wgpu::ComputePipeline,
+    clear_claims_pipeline: wgpu::ComputePipeline,
+    claim_pipeline: wgpu::ComputePipeline,
+    land_pipeline: wgpu::ComputePipeline,
+    nudge_pipeline: wgpu::ComputePipeline,
 }
 
 struct Surface {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Speck {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    word: u32,
+    age: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Speck>() == 32);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -314,6 +341,15 @@ impl Gpu {
             egui: None,
             materials: gpu_parts.materials,
             reactions: gpu_parts.reactions,
+            particles: gpu_parts.particles,
+            claims: gpu_parts.claims,
+            blast_groups: gpu_parts.blast_groups,
+            blast_pipeline: gpu_parts.blast_pipeline,
+            fly_pipeline: gpu_parts.fly_pipeline,
+            clear_claims_pipeline: gpu_parts.clear_claims_pipeline,
+            claim_pipeline: gpu_parts.claim_pipeline,
+            land_pipeline: gpu_parts.land_pipeline,
+            nudge_pipeline: gpu_parts.nudge_pipeline,
         })
     }
 
@@ -497,6 +533,9 @@ impl Gpu {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let bytes = (CELL_COUNT * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.cells[src], 0, &self.cells[dst], 0, bytes);
+        // The blast reads the copy and writes each cell of the live buffer.
+        // Margolus then reads that result. Nothing in either pass shares a write.
+        self.dispatch(&mut encoder, &self.blast_pipeline, src);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
@@ -507,8 +546,29 @@ impl Gpu {
             let (groups_x, groups_y) = workgroups(offset);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
         }
+        self.dispatch(&mut encoder, &self.fly_pipeline, src);
+        self.dispatch(&mut encoder, &self.clear_claims_pipeline, src);
+        self.dispatch(&mut encoder, &self.claim_pipeline, src);
+        self.dispatch(&mut encoder, &self.land_pipeline, src);
+        self.dispatch(&mut encoder, &self.nudge_pipeline, src);
         self.queue.submit([encoder.finish()]);
         self.front = dst;
+    }
+
+    fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        src: usize,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.blast_groups[src], &[]);
+        let (groups_x, groups_y) = cell_groups();
+        pass.dispatch_workgroups(groups_x, groups_y, 1);
     }
 
     fn apply_brush(&mut self, stroke: Stroke) {
@@ -697,6 +757,24 @@ impl Gpu {
         bytemuck::cast_slice(&mapped).to_vec()
     }
 
+    #[cfg(test)]
+    fn read_specks(&self) -> Vec<Speck> {
+        let bytes = (CELL_COUNT * std::mem::size_of::<Speck>()) as u64;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&self.particles, 0, &buffer, 0, bytes);
+        self.queue.submit([encoder.finish()]);
+        let mapped = map_buffer(&self.device, &buffer);
+        bytemuck::cast_slice(&mapped).to_vec()
+    }
+
     fn draw_bloom(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -862,6 +940,15 @@ struct Parts {
     brush_pipeline: wgpu::ComputePipeline,
     materials: wgpu::Buffer,
     reactions: wgpu::Buffer,
+    particles: wgpu::Buffer,
+    claims: wgpu::Buffer,
+    blast_groups: [wgpu::BindGroup; 2],
+    blast_pipeline: wgpu::ComputePipeline,
+    fly_pipeline: wgpu::ComputePipeline,
+    clear_claims_pipeline: wgpu::ComputePipeline,
+    claim_pipeline: wgpu::ComputePipeline,
+    land_pipeline: wgpu::ComputePipeline,
+    nudge_pipeline: wgpu::ComputePipeline,
 }
 
 fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
@@ -1197,6 +1284,48 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         compilation_options: Default::default(),
         cache: None,
     });
+    let particles = zeroed_buffer(device, (CELL_COUNT * 32) as u64);
+    let claims = zeroed_buffer(device, (CELL_COUNT * 4) as u64);
+    let blast_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blast.wgsl").into()),
+    });
+    let blast_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            storage_entry(0),
+            storage_entry(1),
+            storage_entry(2),
+            storage_entry(3),
+        ],
+    });
+    let blast_groups = [0, 1].map(|index| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &blast_layout,
+            entries: &[
+                buffer_entry(0, &cells[index]),
+                buffer_entry(1, &cells[index ^ 1]),
+                buffer_entry(2, &particles),
+                buffer_entry(3, &claims),
+            ],
+        })
+    });
+    let blast_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&blast_layout)],
+        immediate_size: 0,
+    });
+    let blast_pipe = |entry: &str| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&blast_pipeline_layout),
+            module: &blast_shader,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
     Parts {
         cells,
         uniform,
@@ -1210,7 +1339,59 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         brush_pipeline,
         materials,
         reactions,
+        particles,
+        claims,
+        blast_groups,
+        blast_pipeline: blast_pipe("blast"),
+        fly_pipeline: blast_pipe("fly"),
+        clear_claims_pipeline: blast_pipe("clear_claims"),
+        claim_pipeline: blast_pipe("claim"),
+        land_pipeline: blast_pipe("land"),
+        nudge_pipeline: blast_pipe("nudge"),
     }
+}
+
+fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset: 0,
+            size: None,
+        }),
+    }
+}
+
+fn zeroed_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    let zeros = vec![0u8; usize::try_from(size).expect("buffer size")];
+    buffer
+        .slice(..)
+        .get_mapped_range_mut()
+        .expect("zero buffer")
+        .copy_from_slice(&zeros);
+    buffer.unmap();
+    buffer
 }
 
 fn cell_groups() -> (u32, u32) {
@@ -1824,6 +2005,143 @@ mod tests {
             Cell::pack(SAND, 0xab, 0x11, 0x04).to_bits()
         );
         eprintln!("asserted the gpu buffer matched after save, clear, and load");
+    }
+
+    #[test]
+    fn tnt_falls_like_sand() {
+        use crate::grid::{EMPTY, STONE, TNT};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for x in 0..16 {
+            grid.set(x, 40, Cell::pack(STONE, 0, 0, 0));
+        }
+        grid.set(8, 36, Cell::pack(TNT, 0x11, 0, 0));
+        let Some((cells, _)) = play(&grid, 16) else {
+            return;
+        };
+        let landed = (0..crate::grid::GRID_HEIGHT)
+            .find(|y| material_at(&cells, 8, *y) == TNT)
+            .expect("tnt vanished");
+        assert!(landed > 36, "tnt stayed at {landed}");
+        eprintln!("asserted tnt fell to {landed}");
+    }
+
+    #[test]
+    fn a_blast_clears_a_crater_and_the_stone_holds() {
+        use crate::grid::{FIRE, STONE, TNT};
+        let grid = blast_scene();
+        let Some((cells, _)) = play(&grid, 2) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, TNT), 0, "tnt survived the blast");
+        assert_eq!(count_material(&cells, STONE), 5);
+        assert_eq!(material_at(&cells, 28, 120), STONE);
+        let crater = material_at(&cells, 32, 120);
+        assert!(
+            crater == FIRE || crater == 0,
+            "the crater at the tnt was {crater}"
+        );
+        eprintln!("asserted the crater cleared and the stone wall held");
+    }
+
+    #[test]
+    fn a_chain_of_tnt_all_detonates() {
+        use crate::grid::{EMPTY, FIRE, TNT};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(10, 80, Cell::pack(FIRE, 0, 24, 0));
+        for x in 11..=18 {
+            grid.set(x, 80, Cell::pack(TNT, 0, 0, 0));
+        }
+        let Some((cells, _)) = play(&grid, 4) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, TNT), 0);
+        eprintln!("asserted the tnt chain detonated");
+    }
+
+    #[test]
+    fn flung_material_lands_and_the_blast_stays_finite() {
+        use crate::grid::{SAND, STONE, TNT, WATER};
+        let grid = blast_scene();
+        let Some((cells, specks)) = play(&grid, 80) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, SAND), 2);
+        assert_eq!(count_material(&cells, WATER), 2);
+        assert_eq!(count_material(&cells, STONE), 5);
+        assert_eq!(count_material(&cells, TNT), 0);
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.material() == SAND && cell.variation() == 0x21)
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.material() == SAND && cell.variation() == 0x22)
+        );
+        assert!(specks.iter().all(|speck| speck.word == 0));
+        assert!(specks.iter().all(|speck| {
+            speck.x.is_finite()
+                && speck.y.is_finite()
+                && speck.vx.is_finite()
+                && speck.vy.is_finite()
+        }));
+        let words: Vec<u32> = cells.iter().map(|cell| cell.to_bits()).collect();
+        let settled = crate::grid::Grid::from_words(&words).expect("grid");
+        let Some(frame) = colours(super::Gpu::render_scene(
+            &settled,
+            Size {
+                width: 512,
+                height: 288,
+            },
+            true,
+        )) else {
+            return;
+        };
+        assert_finite(&frame.linear);
+        eprintln!("asserted flung sand and water landed, with no non-finite values");
+    }
+
+    fn blast_scene() -> crate::grid::Grid {
+        use crate::grid::{EMPTY, FIRE, SAND, STONE, TNT, WATER};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for y in 118..=122 {
+            grid.set(28, y, Cell::pack(STONE, 0, 0, 0));
+        }
+        grid.set(30, 120, Cell::pack(FIRE, 0, 24, 0));
+        for x in 31..=34 {
+            grid.set(x, 120, Cell::pack(TNT, 0, 0, 0));
+        }
+        grid.set(35, 120, Cell::pack(SAND, 0x21, 0, 0));
+        grid.set(35, 119, Cell::pack(SAND, 0x22, 0, 0));
+        grid.set(33, 118, Cell::pack(WATER, 0, 0, 0));
+        grid.set(34, 118, Cell::pack(WATER, 0, 0, 0));
+        grid
+    }
+
+    fn play(grid: &crate::grid::Grid, passes: u32) -> Option<(Vec<Cell>, Vec<super::Speck>)> {
+        let mut gpu = match pollster::block_on(super::Gpu::open(
+            None,
+            Size {
+                width: 512,
+                height: 288,
+            },
+        )) {
+            Ok(gpu) => gpu,
+            Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
+                panic!("GRAINS_REQUIRE_GPU=1 and no adapter was found: {err}")
+            }
+            Err(err) => {
+                eprintln!("blast asserts skipped: {err}");
+                return None;
+            }
+        };
+        gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
+        gpu.front = 0;
+        for pass in 0..passes {
+            gpu.step(pass % 2);
+        }
+        Some((gpu.read_cells(gpu.front), gpu.read_specks()))
     }
 
     fn colours<T>(result: Result<T, crate::NoAdapter>) -> Option<T> {

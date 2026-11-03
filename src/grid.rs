@@ -18,7 +18,8 @@ pub const SMOKE: u8 = 5;
 pub const WOOD: u8 = 6;
 pub const FIRE: u8 = 7;
 pub const STEAM: u8 = 8;
-pub const MATERIAL_COUNT: usize = 9;
+pub const TNT: u8 = 9;
+pub const MATERIAL_COUNT: usize = 10;
 pub const KEEP: u32 = 255;
 
 pub const KIND_EMPTY: u32 = 0;
@@ -162,6 +163,16 @@ pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
         0.0,
         STYLE_GAS,
     ),
+    info(
+        4,
+        KIND_POWDER,
+        0,
+        EMPTY as u32,
+        [0.55, 0.18, 0.12, 1.0],
+        0.0,
+        0.28,
+        STYLE_GRAIN,
+    ),
 ];
 
 #[repr(C)]
@@ -218,6 +229,7 @@ pub fn material_name(id: u8) -> &'static str {
         WOOD => "wood",
         FIRE => "fire",
         STEAM => "steam",
+        TNT => "tnt",
         _ => "other",
     }
 }
@@ -414,6 +426,11 @@ mod tests {
         assert!(MATERIALS[OIL as usize].density > MATERIALS[SMOKE as usize].density);
         assert_eq!(MATERIALS[STONE as usize].kind, KIND_SOLID);
         assert_eq!(MATERIALS[SAND as usize].kind, KIND_POWDER);
+        assert_eq!(MATERIALS[super::TNT as usize].kind, KIND_POWDER);
+        assert_eq!(
+            MATERIALS[super::TNT as usize].density,
+            MATERIALS[SAND as usize].density
+        );
         assert_eq!(MATERIALS[WATER as usize].kind, KIND_LIQUID);
         assert_eq!(MATERIALS[OIL as usize].kind, KIND_LIQUID);
         assert_eq!(MATERIALS[SMOKE as usize].kind, KIND_GAS);

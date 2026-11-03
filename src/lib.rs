@@ -109,6 +109,7 @@ fn digit(key: KeyCode) -> Option<char> {
         KeyCode::Digit7 => Some('7'),
         KeyCode::Digit8 => Some('8'),
         KeyCode::Digit9 => Some('9'),
+        KeyCode::Digit0 => Some('0'),
         _ => None,
     }
 }
