@@ -15,7 +15,7 @@ The window title is grains. The inner size is 1024 by 600 physical pixels. Each 
 
 ## Controls
 
-Left click paints. Right click erases. The scroll wheel changes the radius. The terminal prints the material and the radius when either changes.
+Left click paints. Right click erases. The scroll wheel changes the radius. The panel on the left does the same things, and the brush does not paint while the pointer is over it. The terminal prints the material and the radius when either changes.
 
 Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, or `9` for steam. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
 
@@ -38,5 +38,4 @@ GitHub Pages deploys from `main` only after the repo's Pages source is set to Gi
 
 ## Roadmap
 
-8. A colourize pass that replaces the debug colours with a palette.
-9. An egui overlay for the material picker.
+9. A colourize pass that replaces the debug colours with a palette.

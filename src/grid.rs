@@ -91,8 +91,8 @@ pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
     ),
     info(1, KIND_GAS, 255, EMPTY as u32, [0.75, 0.75, 0.78, 1.0], 0.0),
     info(5, KIND_SOLID, 0, EMPTY as u32, [0.42, 0.26, 0.12, 1.0], 0.0),
-    info(1, KIND_GAS, 24, SMOKE as u32, [0.95, 0.35, 0.08, 1.0], 6.0),
-    info(1, KIND_GAS, 32, WATER as u32, [0.82, 0.88, 0.92, 1.0], 0.5),
+    info(1, KIND_GAS, 24, SMOKE as u32, [0.95, 0.35, 0.08, 1.0], 12.0),
+    info(1, KIND_GAS, 32, WATER as u32, [0.82, 0.88, 0.92, 1.0], 0.8),
 ];
 
 #[repr(C)]

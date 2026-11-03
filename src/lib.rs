@@ -1,5 +1,6 @@
 mod gpu;
 mod grid;
+mod ui;
 
 #[cfg(target_arch = "wasm32")]
 mod web;
@@ -24,24 +25,21 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use gpu::{Gpu, Paint, Stroke};
-use grid::{EMPTY, FIRE, OIL, SAND, SMOKE, STEAM, STONE, WATER, WOOD, material_name, spawn_word};
-
-const RADIUS_MAX: i32 = 48;
-const PASSES_MAX: u32 = 16;
+use gpu::{EguiFrame, Gpu, Paint, Stroke};
+use grid::material_name;
+use ui::{Controls, PASSES_MAX, RADIUS_MAX};
 
 struct App {
     window: Option<Arc<Window>>,
     gpu: Rc<std::cell::RefCell<Option<Gpu>>>,
     grid: Grid,
-    material: u8,
-    radius: i32,
-    passes: u32,
+    controls: Controls,
+    over_panel: bool,
+    fps: f32,
+    last_frame: web_time::Instant,
+    egui: Option<egui_winit::State>,
     painting: bool,
     erasing: bool,
-    paused: bool,
-    bloom: bool,
-    clear: bool,
     cursor: Option<(f64, f64)>,
     last_cell: Option<(i32, i32)>,
 }
@@ -55,14 +53,13 @@ pub fn run() {
         window: None,
         gpu: Rc::new(std::cell::RefCell::new(None)),
         grid: Grid::demo(),
-        material: SAND,
-        radius: 2,
-        passes: 4,
+        controls: Controls::new(),
+        over_panel: false,
+        fps: 0.0,
+        last_frame: web_time::Instant::now(),
+        egui: None,
         painting: false,
         erasing: false,
-        paused: false,
-        bloom: true,
-        clear: false,
         cursor: None,
         last_cell: None,
     };
@@ -88,6 +85,21 @@ fn window_attributes() -> WindowAttributes {
         WindowAttributes::default()
             .with_title("grains")
             .with_inner_size(PhysicalSize::<u32>::new(1024, 600))
+    }
+}
+
+fn digit(key: KeyCode) -> Option<char> {
+    match key {
+        KeyCode::Digit1 => Some('1'),
+        KeyCode::Digit2 => Some('2'),
+        KeyCode::Digit3 => Some('3'),
+        KeyCode::Digit4 => Some('4'),
+        KeyCode::Digit5 => Some('5'),
+        KeyCode::Digit6 => Some('6'),
+        KeyCode::Digit7 => Some('7'),
+        KeyCode::Digit8 => Some('8'),
+        KeyCode::Digit9 => Some('9'),
+        _ => None,
     }
 }
 
@@ -127,21 +139,40 @@ impl ApplicationHandler for App {
         let slot = Rc::clone(&self.gpu);
         let painted = Arc::clone(&window);
         gpu::wait(async move {
-            let mut gpu = Gpu::for_window(Arc::clone(&painted))
-                .await
-                .unwrap_or_else(|err| panic!("{err}"));
-            let reported = painted.inner_size();
-            gpu.resize(frame_size(&painted, reported));
-            *slot.borrow_mut() = Some(gpu);
-            painted.request_redraw();
+            match Gpu::for_window(Arc::clone(&painted)).await {
+                Ok(mut gpu) => {
+                    let reported = painted.inner_size();
+                    gpu.resize(frame_size(&painted, reported));
+                    *slot.borrow_mut() = Some(gpu);
+                    painted.request_redraw();
+                }
+                Err(err) => {
+                    #[cfg(target_arch = "wasm32")]
+                    web::report_unavailable(&err.to_string());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    panic!("{err}");
+                }
+            }
         });
-        self.window = Some(window);
+        self.window = Some(window.clone());
+        self.egui = Some(egui_winit::State::new(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        ));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.clone() else {
             return;
         };
+        let consumed = self
+            .egui
+            .as_mut()
+            .is_some_and(|ui| ui.on_window_event(&window, &event).consumed);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -149,29 +180,16 @@ impl ApplicationHandler for App {
                     gpu.resize(frame_size(&window, size));
                 }
             }
-            WindowEvent::RedrawRequested => {
-                let stroke = self.stroke_for(&window);
-                let clear = self.clear;
-                self.clear = false;
+            WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
-                    gpu.draw(
-                        &window,
-                        &self.grid,
-                        Paint {
-                            paused: self.paused,
-                            clear,
-                            bloom: self.bloom,
-                            passes: self.passes,
-                            stroke,
-                        },
-                    );
+                    gpu.resize(frame_size(&window, window.inner_size()));
                 }
-                window.request_redraw();
             }
+            WindowEvent::RedrawRequested => self.redraw(&window),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some((position.x, position.y));
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. } if !consumed => {
                 let down = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => self.painting = down,
@@ -182,15 +200,15 @@ impl ApplicationHandler for App {
                     self.last_cell = None;
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !self.over_panel => {
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(offset) => offset.y as f32 / 40.0,
                 };
                 if steps > 0.0 {
-                    self.radius = (self.radius + 1).min(RADIUS_MAX);
+                    self.controls.radius = (self.controls.radius + 1).min(RADIUS_MAX);
                 } else if steps < 0.0 {
-                    self.radius = (self.radius - 1).max(0);
+                    self.controls.radius = (self.controls.radius - 1).max(0);
                 }
                 self.log_brush();
             }
@@ -198,43 +216,8 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed || event.repeat {
                     return;
                 }
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Digit1) => self.set_material(EMPTY),
-                    PhysicalKey::Code(KeyCode::Digit2) => self.set_material(STONE),
-                    PhysicalKey::Code(KeyCode::Digit3) => self.set_material(SAND),
-                    PhysicalKey::Code(KeyCode::Digit4) => self.set_material(WATER),
-                    PhysicalKey::Code(KeyCode::Digit5) => self.set_material(OIL),
-                    PhysicalKey::Code(KeyCode::Digit6) => self.set_material(SMOKE),
-                    PhysicalKey::Code(KeyCode::Digit7) => self.set_material(WOOD),
-                    PhysicalKey::Code(KeyCode::Digit8) => self.set_material(FIRE),
-                    PhysicalKey::Code(KeyCode::Digit9) => self.set_material(STEAM),
-                    PhysicalKey::Code(KeyCode::Minus)
-                    | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
-                        self.passes = self.passes.saturating_sub(1).max(1);
-                        eprintln!("passes {}", self.passes);
-                    }
-                    PhysicalKey::Code(KeyCode::Equal) | PhysicalKey::Code(KeyCode::NumpadAdd) => {
-                        self.passes = (self.passes + 1).min(PASSES_MAX);
-                        eprintln!("passes {}", self.passes);
-                    }
-                    PhysicalKey::Code(KeyCode::KeyC) => self.clear = true,
-                    PhysicalKey::Code(KeyCode::KeyB) => {
-                        self.bloom = !self.bloom;
-                        if self.bloom {
-                            eprintln!("bloom on");
-                        } else {
-                            eprintln!("bloom off");
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::Space) => {
-                        self.paused = !self.paused;
-                        if self.paused {
-                            eprintln!("paused");
-                        } else {
-                            eprintln!("running");
-                        }
-                    }
-                    _ => {}
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    self.key(key);
                 }
             }
             _ => {}
@@ -243,21 +226,136 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn key(&mut self, key: KeyCode) {
+        if let Some(material) = digit(key).and_then(ui::material_for_key) {
+            self.set_material(material);
+            return;
+        }
+        match key {
+            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                self.controls.passes = self.controls.passes.saturating_sub(1).max(1);
+                eprintln!("passes {}", self.controls.passes);
+            }
+            KeyCode::Equal | KeyCode::NumpadAdd => {
+                self.controls.passes = (self.controls.passes + 1).min(PASSES_MAX);
+                eprintln!("passes {}", self.controls.passes);
+            }
+            KeyCode::KeyC => self.controls.clear = true,
+            KeyCode::KeyB => {
+                self.controls.bloom = !self.controls.bloom;
+                if self.controls.bloom {
+                    eprintln!("bloom on");
+                } else {
+                    eprintln!("bloom off");
+                }
+            }
+            KeyCode::Space => {
+                self.controls.paused = !self.controls.paused;
+                if self.controls.paused {
+                    eprintln!("paused");
+                } else {
+                    eprintln!("running");
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn set_material(&mut self, material: u8) {
-        self.material = material;
+        self.controls.material = material;
         self.log_brush();
     }
 
     fn log_brush(&self) {
         eprintln!(
             "brush {} radius {}",
-            material_name(self.material),
-            self.radius
+            material_name(self.controls.material),
+            self.controls.radius
         );
     }
 
+    fn redraw(&mut self, window: &Window) {
+        let now = web_time::Instant::now();
+        let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        if dt > 0.0 && dt < 0.5 {
+            let sample = 1.0 / dt;
+            self.fps = if self.fps == 0.0 {
+                sample
+            } else {
+                self.fps * 0.9 + sample * 0.1
+            };
+        }
+        let before = (
+            self.controls.material,
+            self.controls.radius,
+            self.controls.passes,
+            self.controls.paused,
+            self.controls.bloom,
+        );
+        let ui = self.run_panel(window);
+        if self.controls.material != before.0 || self.controls.radius != before.1 {
+            self.log_brush();
+        }
+        if self.controls.passes != before.2 {
+            eprintln!("passes {}", self.controls.passes);
+        }
+        if self.controls.paused != before.3 {
+            if self.controls.paused {
+                eprintln!("paused");
+            } else {
+                eprintln!("running");
+            }
+        }
+        if self.controls.bloom != before.4 {
+            if self.controls.bloom {
+                eprintln!("bloom on");
+            } else {
+                eprintln!("bloom off");
+            }
+        }
+        let stroke = self.stroke_for(window);
+        let clear = self.controls.clear;
+        self.controls.clear = false;
+        if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
+            gpu.draw(
+                window,
+                &self.grid,
+                Paint {
+                    paused: self.controls.paused,
+                    clear,
+                    bloom: self.controls.bloom,
+                    passes: self.controls.passes,
+                    stroke,
+                },
+                ui,
+            );
+        }
+        window.request_redraw();
+    }
+
+    fn run_panel(&mut self, window: &Window) -> Option<EguiFrame> {
+        let (ctx, input) = {
+            let ui = self.egui.as_mut()?;
+            (ui.egui_ctx().clone(), ui.take_egui_input(window))
+        };
+        let fps = self.fps;
+        let full = ctx.run_pass(input, |ctx| {
+            ui::show(ctx, &mut self.controls, fps);
+            self.over_panel = ctx.is_pointer_over_egui();
+        });
+        let ui = self.egui.as_mut()?;
+        ui.handle_platform_output(window, full.platform_output);
+        let primitives = ctx.tessellate(full.shapes, full.pixels_per_point);
+        Some(EguiFrame {
+            primitives,
+            textures: full.textures_delta,
+            pixels_per_point: full.pixels_per_point,
+        })
+    }
+
     fn stroke_for(&mut self, window: &Window) -> Option<Stroke> {
-        if !self.painting && !self.erasing {
+        if self.over_panel || (!self.painting && !self.erasing) {
             self.last_cell = None;
             return None;
         }
@@ -276,8 +374,8 @@ impl App {
             from_y: from.1,
             to_x: cell.0,
             to_y: cell.1,
-            radius: self.radius as u32,
-            material: spawn_word(self.material),
+            radius: self.controls.radius as u32,
+            material: grid::spawn_word(self.controls.material),
             erase: u32::from(self.erasing),
             clear: 0,
         })

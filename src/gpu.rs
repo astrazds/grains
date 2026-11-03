@@ -38,6 +38,7 @@ pub(crate) struct Gpu {
     brush_pipeline: wgpu::ComputePipeline,
     format: wgpu::TextureFormat,
     bloom: Option<BloomTargets>,
+    egui: Option<egui_wgpu::Renderer>,
     // Bind groups borrow this buffer. The field keeps it alive.
     #[allow(dead_code)]
     materials: wgpu::Buffer,
@@ -91,6 +92,12 @@ pub(crate) struct Stroke {
 }
 
 const _: () = assert!(std::mem::size_of::<Stroke>() == 32);
+
+pub(crate) struct EguiFrame {
+    pub primitives: Vec<egui::ClippedPrimitive>,
+    pub textures: egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
 
 pub(crate) struct Scene {
     pub rgba: Vec<u8>,
@@ -166,7 +173,13 @@ impl Gpu {
         self.reconfigure();
     }
 
-    pub(crate) fn draw(&mut self, window: &Window, grid: &Grid, paint: Paint) {
+    pub(crate) fn draw(
+        &mut self,
+        window: &Window,
+        grid: &Grid,
+        paint: Paint,
+        ui: Option<EguiFrame>,
+    ) {
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
@@ -179,6 +192,9 @@ impl Gpu {
         match current {
             wgpu::CurrentSurfaceTexture::Success(frame) => {
                 self.paint(&frame.texture, grid, &paint);
+                if let Some(ui) = ui {
+                    self.draw_egui(&frame.texture, ui);
+                }
                 window.pre_present_notify();
                 self.queue.present(frame);
             }
@@ -293,6 +309,7 @@ impl Gpu {
             brush_pipeline: gpu_parts.brush_pipeline,
             format,
             bloom: None,
+            egui: None,
             materials: gpu_parts.materials,
             reactions: gpu_parts.reactions,
         })
@@ -365,6 +382,58 @@ impl Gpu {
             self.draw_cells(&mut encoder, &view, self.size, index);
         }
         self.queue.submit([encoder.finish()]);
+    }
+
+    fn draw_egui(&mut self, texture: &wgpu::Texture, ui: EguiFrame) {
+        if self.egui.is_none() {
+            self.egui = Some(egui_wgpu::Renderer::new(
+                &self.device,
+                self.format,
+                egui_wgpu::RendererOptions::default(),
+            ));
+        }
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        let renderer = self.egui.as_mut().unwrap();
+        for (id, images) in &ui.textures.set {
+            for image in images {
+                renderer.update_texture(&device, &queue, *id, image);
+            }
+        }
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.size.width, self.size.height],
+            pixels_per_point: ui.pixels_per_point.max(0.1),
+        };
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let _ = renderer.update_buffers(&device, &queue, &mut encoder, &ui.primitives, &screen);
+        {
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            renderer.render(&mut pass, &ui.primitives, &screen);
+            drop(pass);
+        }
+        queue.submit([encoder.finish()]);
+        for id in &ui.textures.free {
+            renderer.free_texture(id);
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2156,7 +2225,8 @@ mod tests {
         let dark = pixel(&off.rgba, size.width, 9, 8);
         let lit = pixel(&on.rgba, size.width, 9, 8);
         assert_eq!(dark, [0, 0, 0, 255]);
-        assert!(lit[0] > dark[0], "neighbour stayed {lit:?}");
+        assert!(lit[0] > 13, "glow stayed as faint as the old halo {lit:?}");
+        assert!(lit[0] < 80, "glow flooded the neighbour {lit:?}");
         assert_eq!(pixel(&on.rgba, size.width, 200, 200), [0, 0, 0, 255]);
         assert_finite(&on.linear);
         eprintln!("asserted the pixel beside fire rose from {dark:?} to {lit:?}");
