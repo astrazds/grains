@@ -27,6 +27,7 @@ pub(crate) struct Gpu {
     front: usize,
     passes: u32,
     seeded: bool,
+    hold: bool,
     uniform: wgpu::Buffer,
     draw_groups: [wgpu::BindGroup; 2],
     pipeline: wgpu::RenderPipeline,
@@ -298,6 +299,7 @@ impl Gpu {
             front: 0,
             passes: 0,
             seeded: false,
+            hold: false,
             uniform: gpu_parts.uniform,
             draw_groups: gpu_parts.draw_groups,
             pipeline: gpu_parts.pipeline,
@@ -343,6 +345,15 @@ impl Gpu {
             self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
             self.front = 0;
             self.seeded = true;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
+        if self.hold {
+            self.hold = false;
+            self.present(texture, self.front, input.bloom);
+            return;
         }
         if input.clear {
             self.apply_brush(Stroke {
@@ -621,7 +632,54 @@ impl Gpu {
         Ok(gpu.read_cells(gpu.front))
     }
 
-    #[cfg(test)]
+    pub(crate) fn store(&mut self, grid: &Grid) {
+        self.queue
+            .write_buffer(&self.cells[self.front], 0, grid.as_bytes());
+        self.seeded = true;
+        self.hold = true;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn snapshot(&self) -> Vec<u32> {
+        let cells = self.read_cells(self.front);
+        bytemuck::cast_slice(&cells).to_vec()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn snapshot_then(&self, done: impl FnOnce(Result<Vec<u32>, String>) + 'static) {
+        let bytes = (CELL_COUNT * 4) as u64;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&self.cells[self.front], 0, &buffer, 0, bytes);
+        self.queue.submit([encoder.finish()]);
+        let mapped = buffer.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let outcome = match result {
+                    Ok(()) => match mapped.slice(..).get_mapped_range() {
+                        Ok(view) => {
+                            let words = bytemuck::cast_slice(&view).to_vec();
+                            drop(view);
+                            mapped.unmap();
+                            Ok(words)
+                        }
+                        Err(err) => Err(format!("could not read the grid: {err}")),
+                    },
+                    Err(err) => Err(format!("could not read the grid: {err}")),
+                };
+                done(outcome);
+            });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn read_cells(&self, index: usize) -> Vec<crate::grid::Cell> {
         let bytes = (CELL_COUNT * 4) as u64;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1168,7 +1226,7 @@ fn workgroups(offset: u32) -> (u32, u32) {
     (blocks_x.div_ceil(8), blocks_y.div_ceil(8))
 }
 
-#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 fn map_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<u8> {
     let slice = buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -1717,6 +1775,55 @@ mod tests {
         eprintln!("asserted 400x200 byte length = {}", frame.len());
         asserted(400, 200, &frame, 0, 0, [0x0b, 0x02, 0x03, 0xFF]);
         asserted(400, 200, &frame, 0, 1, [0x10, 0x20, 0x30, 0xFF]);
+    }
+
+    #[test]
+    fn a_saved_world_round_trips_through_the_gpu() {
+        use crate::grid::{SAND, STONE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(0, 0, 0, 0));
+        grid.set(3, 4, Cell::pack(SAND, 0xab, 0x11, 0x04));
+        grid.set(8, 9, Cell::pack(STONE, 0x3c, 0, 0));
+        let mut gpu = match pollster::block_on(super::Gpu::open(
+            None,
+            Size {
+                width: 512,
+                height: 288,
+            },
+        )) {
+            Ok(gpu) => gpu,
+            Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
+                panic!("GRAINS_REQUIRE_GPU=1 and no adapter was found: {err}")
+            }
+            Err(err) => {
+                eprintln!("world round trip skipped: {err}");
+                return;
+            }
+        };
+        gpu.store(&grid);
+        let before = gpu.snapshot();
+        let file = crate::world::encode(&before).expect("encode");
+        gpu.apply_brush(super::Stroke {
+            from_x: 0,
+            from_y: 0,
+            to_x: 0,
+            to_y: 0,
+            radius: 0,
+            material: 0,
+            erase: 0,
+            clear: 1,
+        });
+        let cleared = gpu.snapshot();
+        assert_eq!(cleared[4 * 512 + 3], 0, "clear left the sand cell");
+        let words = crate::world::decode(&file).expect("decode");
+        let loaded = crate::grid::Grid::from_words(&words).expect("grid");
+        gpu.store(&loaded);
+        let after = gpu.snapshot();
+        assert_eq!(after, before);
+        assert_eq!(
+            after[4 * 512 + 3],
+            Cell::pack(SAND, 0xab, 0x11, 0x04).to_bits()
+        );
+        eprintln!("asserted the gpu buffer matched after save, clear, and load");
     }
 
     fn colours<T>(result: Result<T, crate::NoAdapter>) -> Option<T> {

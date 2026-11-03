@@ -19,6 +19,8 @@ Left click paints. Right click erases. The scroll wheel changes the radius. The 
 
 Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, or `9` for steam. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
 
+Press `S` to save the grid to `world.grains`, or `L` to load that file. The panel has the same buttons. A file with the wrong magic, the wrong version, or a truncated body is refused, and the message is shown in the panel. In the browser, Save downloads `world.grains` and Load opens a file picker. Copy link puts a small world in the page address.
+
 ## Build the web page
 
 Install the `wasm32-unknown-unknown` target and wasm-bindgen 0.2.130. Then build the library and the page.

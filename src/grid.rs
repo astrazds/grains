@@ -240,6 +240,10 @@ impl Cell {
         self.0
     }
 
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
     pub fn material(self) -> u8 {
         (self.0 >> MATERIAL_SHIFT) as u8
     }
@@ -354,6 +358,18 @@ impl Grid {
 
     pub fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(self.cells.as_slice())
+    }
+
+    pub fn from_words(words: &[u32]) -> Result<Self, String> {
+        if words.len() != CELL_COUNT {
+            return Err("this world has the wrong number of cells".to_string());
+        }
+        let cells: Vec<Cell> = words.iter().copied().map(Cell::from_bits).collect();
+        let cells: Box<[Cell; CELL_COUNT]> = cells
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| "this world has the wrong number of cells".to_string())?;
+        Ok(Self { cells })
     }
 }
 
