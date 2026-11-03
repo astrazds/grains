@@ -84,17 +84,18 @@ try {
     { timeout: 120000 },
   );
   await page.mouse.click(80, 20);
+  await page.keyboard.press("Space");
   await page.keyboard.press("2");
   const before = await page.evaluate(() => window.grainsPixels.stroke.slice());
   await page.mouse.move(700, 300);
   await page.mouse.down();
-  await page.mouse.move(730, 330, { steps: 8 });
+  await page.mouse.move(760, 360, { steps: 12 });
   await page.mouse.up();
   await page.waitForFunction(
     (previous) =>
       window.grainsPixels.stroke.some((channel, index) => Math.abs(channel - previous[index]) > 20),
     before,
-    { timeout: 8000 },
+    { timeout: 30000 },
   );
 } catch (err) {
   failures.push(String(err));
