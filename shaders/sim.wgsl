@@ -12,7 +12,7 @@ struct Sim {
     height: u32,
     awake: u32,
     chunk_cols: u32,
-    _pad0: u32,
+    tick: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -103,7 +103,10 @@ fn beside_reaction(word: u32, x: u32, y: u32) -> bool {
     if (x + 1u < sim.width && reacts_with(word, src[index_at(x + 1u, y)])) {
         return true;
     }
-    return false;
+    if (y > 0u && reacts_with(word, src[index_at(x, y - 1u)])) {
+        return true;
+    }
+    return y + 1u < sim.height && reacts_with(word, src[index_at(x, y + 1u)]);
 }
 
 // Phases 0 and 1 both rise. A single phase never lands on the pass where
@@ -160,9 +163,8 @@ fn grounded(word: u32, x: u32, y: u32) -> bool {
 fn can_flow(word: u32, x: u32, y: u32) -> bool {
     let kind = kind_of(word);
     if (kind == KIND_LIQUID) {
-        // Every other pass, so a landed pool creeps instead of flinging.
-        let tick = ((x + sim.offset) % 2u) == 0u;
-        return tick && grounded(word, x, y);
+        // Allow both block offsets, then rest for two passes.
+        return sim.tick % 4u < 2u && grounded(word, x, y);
     }
     if (kind == KIND_GAS) {
         return gas_phase(word) == 2u;
@@ -272,11 +274,7 @@ fn age(word: u32) -> u32 {
 
 @compute @workgroup_size(8, 8)
 fn step(@builtin(global_invocation_id) id: vec3<u32>) {
-    let origin = id.xy * 2u + vec2<u32>(sim.offset, sim.offset);
-    if (origin.x + 1u >= sim.width || origin.y + 1u >= sim.height) {
-        return;
-    }
-    update_block(origin);
+    update_partition(id.xy * 2u);
 }
 
 fn mark_dirty(x: u32, y: u32) {
@@ -285,15 +283,27 @@ fn mark_dirty(x: u32, y: u32) {
     atomicOr(&dirty[cy * sim.chunk_cols + cx], 1u);
 }
 
+// Missing members of a boundary block act as solid walls. The unsigned
+// coordinate immediately before zero wraps to 0xffffffff.
+fn read_cell(pos: vec2<u32>) -> u32 {
+    if (pos.x >= sim.width || pos.y >= sim.height) { return 2u; }
+    return src[index_at(pos.x, pos.y)];
+}
+
+fn write_cell(pos: vec2<u32>, before: u32, after: u32) {
+    if (pos.x >= sim.width || pos.y >= sim.height) { return; }
+    dst[index_at(pos.x, pos.y)] = after;
+    if (before != after) { mark_dirty(pos.x, pos.y); }
+}
+
 fn update_block(origin: vec2<u32>) {
-    let i0 = index_at(origin.x, origin.y);
-    let i1 = index_at(origin.x + 1u, origin.y);
-    let i2 = index_at(origin.x, origin.y + 1u);
-    let i3 = index_at(origin.x + 1u, origin.y + 1u);
-    let was0 = src[i0];
-    let was1 = src[i1];
-    let was2 = src[i2];
-    let was3 = src[i3];
+    let tr = origin + vec2<u32>(1u, 0u);
+    let bl = origin + vec2<u32>(0u, 1u);
+    let br = origin + vec2<u32>(1u, 1u);
+    let was0 = read_cell(origin);
+    let was1 = read_cell(tr);
+    let was2 = read_cell(bl);
+    let was3 = read_cell(br);
     var top_left = was0;
     var top_right = was1;
     var bottom_left = was2;
@@ -323,18 +333,28 @@ fn update_block(origin: vec2<u32>) {
         spread(&bottom_left, &bottom_right, origin.x, bottom_y, !left_fell, !right_fell);
     }
 
-    let next0 = age(top_left);
-    let next1 = age(top_right);
-    let next2 = age(bottom_left);
-    let next3 = age(bottom_right);
-    dst[i0] = next0;
-    dst[i1] = next1;
-    dst[i2] = next2;
-    dst[i3] = next3;
-    if (next0 != was0) { mark_dirty(origin.x, origin.y); }
-    if (next1 != was1) { mark_dirty(origin.x + 1u, origin.y); }
-    if (next2 != was2) { mark_dirty(origin.x, origin.y + 1u); }
-    if (next3 != was3) { mark_dirty(origin.x + 1u, origin.y + 1u); }
+    write_cell(origin, was0, age(top_left));
+    write_cell(tr, was1, age(top_right));
+    write_cell(bl, was2, age(bottom_left));
+    write_cell(br, was3, age(bottom_right));
+}
+
+fn update_partition(base: vec2<u32>) {
+    if (base.x >= sim.width || base.y >= sim.height) { return; }
+    let origin = base + vec2<u32>(sim.offset);
+    if (origin.x < sim.width && origin.y < sim.height) {
+        update_block(origin);
+    }
+    if (sim.offset == 0u) { return; }
+    if (base.x == 0u && origin.y < sim.height) {
+        update_block(vec2<u32>(0xffffffffu, origin.y));
+    }
+    if (base.y == 0u && origin.x < sim.width) {
+        update_block(vec2<u32>(origin.x, 0xffffffffu));
+    }
+    if (all(base == vec2<u32>(0u))) {
+        update_block(vec2<u32>(0xffffffffu));
+    }
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -343,10 +363,6 @@ fn step_chunks(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let packed = chunk_list[id.z];
-    let origin_x = (packed & 0xffffu) * CHUNK + sim.offset + id.x * 2u;
-    let origin_y = (packed >> 16u) * CHUNK + sim.offset + id.y * 2u;
-    if (origin_x + 1u >= sim.width || origin_y + 1u >= sim.height) {
-        return;
-    }
-    update_block(vec2<u32>(origin_x, origin_y));
+    let chunk = vec2<u32>(packed & 0xffffu, packed >> 16u);
+    update_partition(chunk * CHUNK + id.xy * 2u);
 }

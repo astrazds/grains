@@ -114,7 +114,7 @@ struct SimUniform {
     height: u32,
     awake: u32,
     chunk_cols: u32,
-    _pad0: u32,
+    tick: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -454,7 +454,6 @@ impl Gpu {
         for _ in 0..input.passes {
             let offset = self.passes % 2;
             self.step(offset);
-            self.passes += 1;
         }
         self.present(texture, self.front, input.bloom, ui);
     }
@@ -802,6 +801,8 @@ impl Gpu {
     }
 
     fn step(&mut self, offset: u32) {
+        let tick = self.passes;
+        self.passes = self.passes.wrapping_add(1);
         if self.chunked && self.awake.iter().all(|on| !on) {
             return;
         }
@@ -823,7 +824,7 @@ impl Gpu {
             height: self.world_h,
             awake,
             chunk_cols: chunk_cols(self.world_w) as u32,
-            _pad0: 0,
+            tick,
             _pad1: 0,
             _pad2: 0,
         };
@@ -858,7 +859,7 @@ impl Gpu {
                 });
                 pass.set_pipeline(&self.sim_pipeline);
                 pass.set_bind_group(0, &self.sim_groups[src], &[]);
-                let (groups_x, groups_y) = workgroups(self.world_w, self.world_h, offset);
+                let (groups_x, groups_y) = workgroups(self.world_w, self.world_h);
                 pass.dispatch_workgroups(groups_x, groups_y, 1);
             }
             self.dispatch(&mut encoder, &self.fly_pipeline, src);
@@ -1963,10 +1964,8 @@ fn cell_groups(width: u32, height: u32) -> (u32, u32) {
     (width.div_ceil(8), height.div_ceil(8))
 }
 
-fn workgroups(width: u32, height: u32, offset: u32) -> (u32, u32) {
-    let blocks_x = (width - offset) / 2;
-    let blocks_y = (height - offset) / 2;
-    (blocks_x.div_ceil(8), blocks_y.div_ceil(8))
+fn workgroups(width: u32, height: u32) -> (u32, u32) {
+    (width.div_ceil(16), height.div_ceil(16))
 }
 
 fn chunk_cols(width: u32) -> usize {
@@ -2810,6 +2809,67 @@ mod tests {
         };
         assert_eq!(chunked, full);
         eprintln!("asserted chunked and full simulations matched");
+    }
+
+    #[test]
+    fn sim_regression_sand_falls_at_the_world_edges() {
+        use crate::grid::{EMPTY, SAND};
+        let grid = crate::grid::Grid::filled(16, 16, |x, y| {
+            Cell::pack(
+                if (x == 0 || x == 15) && y == 0 {
+                    SAND
+                } else {
+                    EMPTY
+                },
+                0,
+                0,
+                0,
+            )
+        });
+        for chunked in [true, false] {
+            let Some(cells) = run_world(&grid, 15, chunked) else {
+                return;
+            };
+            assert_eq!(cells[15 * 16].material(), SAND);
+            assert_eq!(cells[15 * 16 + 15].material(), SAND);
+        }
+    }
+
+    #[test]
+    fn sim_regression_fire_waits_for_vertical_wood_contact() {
+        use crate::grid::{EMPTY, FIRE, WOOD};
+        let grid = crate::grid::Grid::filled(16, 16, |x, y| match (x, y) {
+            (4, 3) => Cell::pack(FIRE, 0, 24, 0),
+            (4, 4) => Cell::pack(WOOD, 0, 0, 0),
+            _ => Cell::pack(EMPTY, 0, 0, 0),
+        });
+        let Some(cells) = run_world(&grid, 2, true) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, WOOD), 0);
+    }
+
+    #[test]
+    fn sim_regression_water_can_flow_left_on_a_flat_floor() {
+        use crate::grid::{EMPTY, STONE, WATER};
+        let grid = crate::grid::Grid::filled(16, 16, |x, y| {
+            let material = if y == 8 || x == 8 {
+                STONE
+            } else if x == 7 && y == 7 {
+                WATER
+            } else {
+                EMPTY
+            };
+            Cell::pack(material, 0, 0, 0)
+        });
+        let Some(cells) = run_world(&grid, 4, true) else {
+            return;
+        };
+        assert!(
+            cells[7 * 16..7 * 16 + 7]
+                .iter()
+                .any(|cell| cell.material() == WATER)
+        );
     }
 
     #[test]
