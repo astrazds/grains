@@ -12,6 +12,68 @@ pub const LETTERBOX: [u8; 4] = [20, 20, 23, 255];
 pub const EMPTY: u8 = 0;
 pub const SAND: u8 = 1;
 pub const STONE: u8 = 2;
+pub const WATER: u8 = 3;
+pub const OIL: u8 = 4;
+pub const SMOKE: u8 = 5;
+pub const MATERIAL_COUNT: usize = 6;
+
+pub const KIND_EMPTY: u32 = 0;
+pub const KIND_SOLID: u32 = 1;
+pub const KIND_POWDER: u32 = 2;
+pub const KIND_LIQUID: u32 = 3;
+pub const KIND_GAS: u32 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MaterialInfo {
+    pub density: u32,
+    pub kind: u32,
+    pub life: u32,
+    pub _pad: u32,
+    pub colour: [f32; 4],
+}
+
+const fn info(density: u32, kind: u32, life: u32, colour: [f32; 4]) -> MaterialInfo {
+    MaterialInfo {
+        density,
+        kind,
+        life,
+        _pad: 0,
+        colour,
+    }
+}
+
+pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
+    info(0, KIND_EMPTY, 0, [0.0, 0.0, 0.0, 1.0]),
+    info(4, KIND_POWDER, 0, [0.86, 0.72, 0.38, 1.0]),
+    info(5, KIND_SOLID, 0, [0.45, 0.47, 0.50, 1.0]),
+    info(3, KIND_LIQUID, 0, [0.25, 0.45, 0.85, 1.0]),
+    info(2, KIND_LIQUID, 0, [0.55, 0.35, 0.12, 1.0]),
+    info(1, KIND_GAS, 255, [0.75, 0.75, 0.78, 1.0]),
+];
+
+const _: () = assert!(std::mem::size_of::<MaterialInfo>() == 32);
+
+pub fn material_info(id: u8) -> MaterialInfo {
+    MATERIALS.get(id as usize).copied().unwrap_or(MATERIALS[0])
+}
+
+pub fn spawn_word(id: u8) -> u32 {
+    let info = material_info(id);
+    Cell::pack(id, 0, info.life as u8, 0).to_bits()
+}
+
+pub fn material_name(id: u8) -> &'static str {
+    match id {
+        EMPTY => "empty",
+        SAND => "sand",
+        STONE => "stone",
+        WATER => "water",
+        OIL => "oil",
+        SMOKE => "smoke",
+        _ => "other",
+    }
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -177,6 +239,23 @@ fn sand_pile(x: usize, y: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Cell, Fit, Size, cell_at, letterbox, physical_pixel};
+
+    #[test]
+    fn material_table_orders_density_and_kind() {
+        use super::{
+            KIND_GAS, KIND_LIQUID, KIND_POWDER, KIND_SOLID, MATERIALS, OIL, SAND, SMOKE, STONE,
+            WATER,
+        };
+        assert!(MATERIALS[SAND as usize].density > MATERIALS[WATER as usize].density);
+        assert!(MATERIALS[WATER as usize].density > MATERIALS[OIL as usize].density);
+        assert!(MATERIALS[OIL as usize].density > MATERIALS[SMOKE as usize].density);
+        assert_eq!(MATERIALS[STONE as usize].kind, KIND_SOLID);
+        assert_eq!(MATERIALS[SAND as usize].kind, KIND_POWDER);
+        assert_eq!(MATERIALS[WATER as usize].kind, KIND_LIQUID);
+        assert_eq!(MATERIALS[OIL as usize].kind, KIND_LIQUID);
+        assert_eq!(MATERIALS[SMOKE as usize].kind, KIND_GAS);
+        assert_eq!(MATERIALS[SMOKE as usize].life, 255);
+    }
 
     #[test]
     fn pack_lays_out_the_word() {

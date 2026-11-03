@@ -14,8 +14,17 @@ struct Frame {
     pad2: u32,
 }
 
+struct MaterialInfo {
+    density: u32,
+    kind: u32,
+    life: u32,
+    _pad: u32,
+    colour: vec4<f32>,
+}
+
 @group(0) @binding(0) var<storage, read> cells: array<u32>;
 @group(0) @binding(1) var<uniform> frame: Frame;
+@group(0) @binding(2) var<storage, read> materials: array<MaterialInfo>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -49,11 +58,12 @@ fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let variation = (word >> VARIATION_SHIFT) & 0xffu;
     let life = (word >> LIFE_SHIFT) & 0xffu;
     let _flags = (word >> FLAGS_SHIFT) & 0xffu;
-    if (material == 1u) {
-        return vec4<f32>(0.86, 0.72, 0.38, 1.0);
-    }
-    if (material == 2u) {
-        return vec4<f32>(0.45, 0.47, 0.50, 1.0);
+    if (material < 6u) {
+        let colour = materials[material].colour;
+        if (materials[material].kind == 4u) {
+            return vec4<f32>(colour.rgb * (f32(life) / 255.0), 1.0);
+        }
+        return colour;
     }
     return vec4<f32>(f32(material) / 255.0, f32(variation) / 255.0, f32(life) / 255.0, 1.0);
 }
