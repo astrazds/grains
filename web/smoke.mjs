@@ -53,7 +53,9 @@ try {
     },
     args: [
       "--enable-unsafe-webgpu",
-      ...(linux ? ["--enable-features=Vulkan", "--use-angle=vulkan", "--use-vulkan=native"] : []),
+      // Software Vulkan on a small runner can exceed Chrome's GPU watchdog
+      // during pipeline warm-up. The pixel assertions have their own deadlines.
+      ...(linux ? ["--enable-features=Vulkan", "--use-angle=vulkan", "--use-vulkan=native", "--disable-gpu-watchdog"] : []),
       "--ignore-gpu-blocklist",
       "--disable-gpu-sandbox",
       "--no-sandbox",
