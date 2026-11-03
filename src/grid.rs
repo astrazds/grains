@@ -35,28 +35,64 @@ pub struct MaterialInfo {
     pub life: u32,
     pub becomes: u32,
     pub colour: [f32; 4],
+    pub emissive: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-const fn info(density: u32, kind: u32, life: u32, becomes: u32, colour: [f32; 4]) -> MaterialInfo {
+const fn info(
+    density: u32,
+    kind: u32,
+    life: u32,
+    becomes: u32,
+    colour: [f32; 4],
+    emissive: f32,
+) -> MaterialInfo {
     MaterialInfo {
         density,
         kind,
         life,
         becomes,
         colour,
+        emissive,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     }
 }
 
 pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
-    info(0, KIND_EMPTY, 0, EMPTY as u32, [0.0, 0.0, 0.0, 1.0]),
-    info(4, KIND_POWDER, 0, EMPTY as u32, [0.86, 0.72, 0.38, 1.0]),
-    info(5, KIND_SOLID, 0, EMPTY as u32, [0.45, 0.47, 0.50, 1.0]),
-    info(3, KIND_LIQUID, 0, EMPTY as u32, [0.25, 0.45, 0.85, 1.0]),
-    info(2, KIND_LIQUID, 0, EMPTY as u32, [0.55, 0.35, 0.12, 1.0]),
-    info(1, KIND_GAS, 255, EMPTY as u32, [0.75, 0.75, 0.78, 1.0]),
-    info(5, KIND_SOLID, 0, EMPTY as u32, [0.42, 0.26, 0.12, 1.0]),
-    info(1, KIND_GAS, 24, SMOKE as u32, [0.95, 0.35, 0.08, 1.0]),
-    info(1, KIND_GAS, 32, WATER as u32, [0.82, 0.88, 0.92, 1.0]),
+    info(0, KIND_EMPTY, 0, EMPTY as u32, [0.0, 0.0, 0.0, 1.0], 0.0),
+    info(
+        4,
+        KIND_POWDER,
+        0,
+        EMPTY as u32,
+        [0.86, 0.72, 0.38, 1.0],
+        0.0,
+    ),
+    info(5, KIND_SOLID, 0, EMPTY as u32, [0.45, 0.47, 0.50, 1.0], 0.0),
+    info(
+        3,
+        KIND_LIQUID,
+        0,
+        EMPTY as u32,
+        [0.25, 0.45, 0.85, 1.0],
+        0.0,
+    ),
+    info(
+        2,
+        KIND_LIQUID,
+        0,
+        EMPTY as u32,
+        [0.55, 0.35, 0.12, 1.0],
+        0.0,
+    ),
+    info(1, KIND_GAS, 255, EMPTY as u32, [0.75, 0.75, 0.78, 1.0], 0.0),
+    info(5, KIND_SOLID, 0, EMPTY as u32, [0.42, 0.26, 0.12, 1.0], 0.0),
+    info(1, KIND_GAS, 24, SMOKE as u32, [0.95, 0.35, 0.08, 1.0], 6.0),
+    info(1, KIND_GAS, 32, WATER as u32, [0.82, 0.88, 0.92, 1.0], 0.5),
 ];
 
 #[repr(C)]
@@ -86,7 +122,7 @@ pub fn reaction(a: u8, b: u8) -> Reaction {
     REACTIONS[a as usize * MATERIAL_COUNT + b as usize]
 }
 
-const _: () = assert!(std::mem::size_of::<MaterialInfo>() == 32);
+const _: () = assert!(std::mem::size_of::<MaterialInfo>() == 48);
 
 pub fn material_info(id: u8) -> MaterialInfo {
     MATERIALS.get(id as usize).copied().unwrap_or(MATERIALS[0])
@@ -295,6 +331,11 @@ mod tests {
         assert_eq!(MATERIALS[super::WOOD as usize].kind, KIND_SOLID);
         assert_eq!(MATERIALS[super::FIRE as usize].becomes, SMOKE as u32);
         assert_eq!(MATERIALS[super::STEAM as usize].becomes, WATER as u32);
+        assert!(
+            MATERIALS[super::FIRE as usize].emissive > MATERIALS[super::STEAM as usize].emissive
+        );
+        assert!(MATERIALS[super::STEAM as usize].emissive > MATERIALS[SAND as usize].emissive);
+        assert_eq!(MATERIALS[SAND as usize].emissive, 0.0);
         assert_eq!(
             super::reaction(super::WOOD, super::FIRE).a,
             super::FIRE as u32
