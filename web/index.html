@@ -7,14 +7,23 @@
       html, body {
         margin: 0;
         height: 100%;
+        overflow: hidden;
         background: rgb(20, 20, 23);
+        color: #ececec;
+        font: 16px/1.45 sans-serif;
       }
       #grains {
+        position: fixed;
+        inset: 0;
         display: block;
         width: 100%;
         height: 100%;
         image-rendering: pixelated;
         touch-action: none;
+      }
+      #grains-webgpu {
+        margin: 2rem;
+        max-width: 36rem;
       }
     </style>
   </head>

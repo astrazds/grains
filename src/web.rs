@@ -31,6 +31,29 @@ pub fn physical_size(window: &winit::window::Window) -> crate::Size {
     }
 }
 
+pub fn report_unavailable(detail: &str) {
+    let Some(browser) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = browser.document() else {
+        return;
+    };
+    if let Some(canvas) = document.get_element_by_id("grains") {
+        let _ = canvas.set_attribute("hidden", "hidden");
+    }
+    let Ok(node) = document.create_element("p") else {
+        return;
+    };
+    node.set_id("grains-webgpu");
+    node.set_text_content(Some(
+        "grains needs WebGPU, and this browser does not have it. Try a current Chrome, Edge, or Firefox.",
+    ));
+    let _ = node.set_attribute("title", detail);
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&node);
+    }
+}
+
 fn device_pixels(css_px: i32, ratio: f64) -> u32 {
     crate::physical_pixel(f64::from(css_px.max(0)), ratio).max(0) as u32
 }
