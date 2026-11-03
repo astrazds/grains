@@ -1,0 +1,202 @@
+pub const GRID_WIDTH: usize = 512;
+pub const GRID_HEIGHT: usize = 288;
+pub const CELL_COUNT: usize = GRID_WIDTH * GRID_HEIGHT;
+
+pub(crate) const MATERIAL_SHIFT: u32 = 0;
+pub(crate) const VARIATION_SHIFT: u32 = 8;
+pub(crate) const LIFE_SHIFT: u32 = 16;
+pub(crate) const FLAGS_SHIFT: u32 = 24;
+
+pub const LETTERBOX: [u8; 4] = [20, 20, 23, 255];
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Cell(u32);
+
+impl Cell {
+    pub fn pack(material: u8, variation: u8, life: u8, flags: u8) -> Self {
+        Self(
+            (u32::from(material) << MATERIAL_SHIFT)
+                | (u32::from(variation) << VARIATION_SHIFT)
+                | (u32::from(life) << LIFE_SHIFT)
+                | (u32::from(flags) << FLAGS_SHIFT),
+        )
+    }
+
+    pub fn to_bits(self) -> u32 {
+        self.0
+    }
+
+    pub fn material(self) -> u8 {
+        (self.0 >> MATERIAL_SHIFT) as u8
+    }
+
+    pub fn variation(self) -> u8 {
+        (self.0 >> VARIATION_SHIFT) as u8
+    }
+
+    pub fn life(self) -> u8 {
+        (self.0 >> LIFE_SHIFT) as u8
+    }
+
+    pub fn flags(self) -> u8 {
+        (self.0 >> FLAGS_SHIFT) as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    pub scale: u32,
+    pub origin_x: i32,
+    pub origin_y: i32,
+}
+
+pub fn letterbox(size: Size) -> Option<Fit> {
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let scale = (size.width / GRID_WIDTH as u32)
+        .min(size.height / GRID_HEIGHT as u32)
+        .max(1);
+    let span_x = GRID_WIDTH as i32 * scale as i32;
+    let span_y = GRID_HEIGHT as i32 * scale as i32;
+    Some(Fit {
+        scale,
+        origin_x: (size.width as i32 - span_x) / 2,
+        origin_y: (size.height as i32 - span_y) / 2,
+    })
+}
+
+pub struct Grid {
+    cells: Box<[Cell; CELL_COUNT]>,
+}
+
+impl Grid {
+    pub fn from_fn(mut each: impl FnMut(usize, usize) -> Cell) -> Self {
+        let mut cells = vec![Cell::pack(0, 0, 0, 0); CELL_COUNT];
+        for y in 0..GRID_HEIGHT {
+            for x in 0..GRID_WIDTH {
+                cells[index(x, y)] = each(x, y);
+            }
+        }
+        Self {
+            cells: heap_cells(cells),
+        }
+    }
+
+    pub fn random() -> Self {
+        let mut state = 0x6A09_E667_u32;
+        Self::from_fn(|_x, _y| {
+            let bits = xorshift32(&mut state);
+            Cell::pack(
+                bits as u8,
+                (bits >> 8) as u8,
+                (bits >> 16) as u8,
+                (bits >> 24) as u8,
+            )
+        })
+    }
+
+    pub fn cell(&self, x: usize, y: usize) -> Cell {
+        self.cells[index(x, y)]
+    }
+
+    pub fn set(&mut self, x: usize, y: usize, cell: Cell) {
+        let index = index(x, y);
+        self.cells[index] = cell;
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(self.cells.as_slice())
+    }
+}
+
+fn index(x: usize, y: usize) -> usize {
+    assert!(
+        x < GRID_WIDTH && y < GRID_HEIGHT,
+        "{x},{y} outside the grid"
+    );
+    y * GRID_WIDTH + x
+}
+
+fn heap_cells(cells: Vec<Cell>) -> Box<[Cell; CELL_COUNT]> {
+    cells
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| panic!("grid length is not {CELL_COUNT}"))
+}
+
+fn xorshift32(state: &mut u32) -> u32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cell, Size, letterbox};
+
+    #[test]
+    fn pack_lays_out_the_word() {
+        let cell = Cell::pack(0x11, 0x22, 0x33, 0x44);
+        assert_eq!(cell.to_bits(), 0x4433_2211);
+        assert_eq!(cell.material(), 0x11);
+        assert_eq!(cell.variation(), 0x22);
+        assert_eq!(cell.life(), 0x33);
+        assert_eq!(cell.flags(), 0x44);
+    }
+
+    #[test]
+    fn letterbox_known_viewports() {
+        expect_fit(512, 288, 1, 0, 0);
+        expect_fit(1024, 576, 2, 0, 0);
+        expect_fit(1024, 600, 2, 0, 12);
+        expect_fit(800, 600, 1, 144, 156);
+        expect_fit(400, 200, 1, -56, -44);
+        expect_fit(515, 288, 1, 1, 0);
+        expect_fit(10000, 10, 1, 4744, -139);
+        assert!(
+            letterbox(Size {
+                width: 0,
+                height: 288
+            })
+            .is_none()
+        );
+        assert!(
+            letterbox(Size {
+                width: 512,
+                height: 0
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn from_fn_stores_the_placed_cell() {
+        let grid = super::Grid::from_fn(|x, y| {
+            if x == 511 && y == 287 {
+                Cell::pack(0x11, 0x22, 0x33, 0x44)
+            } else {
+                Cell::pack(0, 0, 0, 0)
+            }
+        });
+        assert_eq!(grid.cell(511, 287).to_bits(), 0x4433_2211);
+        assert_eq!(grid.cell(1, 0).to_bits(), 0);
+    }
+
+    fn expect_fit(width: u32, height: u32, scale: u32, origin_x: i32, origin_y: i32) {
+        let fit = letterbox(Size { width, height }).unwrap();
+        assert_eq!(fit.scale, scale);
+        assert_eq!(fit.origin_x, origin_x);
+        assert_eq!(fit.origin_y, origin_y);
+    }
+}
