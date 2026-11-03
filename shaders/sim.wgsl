@@ -5,7 +5,7 @@ const KIND_LIQUID: u32 = 3u;
 const KIND_GAS: u32 = 4u;
 const WIDTH: u32 = 512u;
 const HEIGHT: u32 = 288u;
-const MATERIAL_COUNT: u32 = 9u;
+const MATERIAL_COUNT: u32 = 10u;
 
 struct Sim {
     offset: u32,

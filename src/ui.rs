@@ -1,13 +1,13 @@
 use egui::Color32;
 
 use crate::grid::{
-    EMPTY, FIRE, MATERIALS, OIL, SAND, SMOKE, STEAM, STONE, WATER, WOOD, material_name,
+    EMPTY, FIRE, MATERIALS, OIL, SAND, SMOKE, STEAM, STONE, TNT, WATER, WOOD, material_name,
 };
 
 pub const RADIUS_MAX: i32 = 48;
 pub const PASSES_MAX: u32 = 16;
 
-const SHORTCUTS: [(char, u8); 9] = [
+const SHORTCUTS: [(char, u8); 10] = [
     ('1', EMPTY),
     ('2', STONE),
     ('3', SAND),
@@ -17,6 +17,7 @@ const SHORTCUTS: [(char, u8); 9] = [
     ('7', WOOD),
     ('8', FIRE),
     ('9', STEAM),
+    ('0', TNT),
 ];
 
 pub fn material_for_key(key: char) -> Option<u8> {
@@ -187,6 +188,7 @@ mod tests {
         assert_eq!(rows[crate::grid::STONE as usize].key, Some('2'));
         assert_eq!(rows[WOOD as usize].key, Some('7'));
         assert_eq!(rows[crate::grid::FIRE as usize].key, Some('8'));
+        assert_eq!(rows[crate::grid::TNT as usize].key, Some('0'));
     }
 
     #[test]

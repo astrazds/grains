@@ -17,7 +17,7 @@ The window title is grains. The inner size is 1024 by 600 physical pixels. Each 
 
 Left click paints. Right click erases. The scroll wheel changes the radius. The panel on the left does the same things, and the brush does not paint while the pointer is over it. The terminal prints the material and the radius when either changes.
 
-Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, or `9` for steam. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
+Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, `9` for steam, or `0` for tnt. Tnt falls like sand. Touching fire detonates it: stone stays, loose grains are thrown clear, and tnt beside the blast goes off too. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
 
 Press `S` to save the grid to `world.grains`, or `L` to load that file. The panel has the same buttons. A file with the wrong magic, the wrong version, or a truncated body is refused, and the message is shown in the panel. In the browser, Save downloads `world.grains` and Load opens a file picker. Copy link puts a small world in the page address.
 

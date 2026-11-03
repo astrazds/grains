@@ -73,7 +73,7 @@ fn shade(position: vec4<f32>) -> Shade {
     let variation = (word >> VARIATION_SHIFT) & 0xffu;
     let life = (word >> LIFE_SHIFT) & 0xffu;
     let _flags = (word >> FLAGS_SHIFT) & 0xffu;
-    if (material >= 9u) {
+    if (material >= 10u) {
         // Ids past the table stay on the debug path so letterbox tests can read the bytes back.
         let debug = vec3<f32>(f32(material), f32(variation), f32(life)) / 255.0;
         return Shade(vec4<f32>(debug, 2.0), vec4<f32>(0.0), true);
