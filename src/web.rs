@@ -58,6 +58,12 @@ pub fn report_unavailable(detail: &str) {
     }
 }
 
+pub fn probe() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .is_some_and(|query| query.split(['?', '&']).any(|part| part == "probe=1"))
+}
+
 pub fn hash() -> String {
     let Some(window) = web_sys::window() else {
         return String::new();

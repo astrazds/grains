@@ -54,6 +54,7 @@ fn paint(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 fn grain_of(x: u32, y: u32) -> u32 {
-    let mixed = x * 374761393u ^ y * 668265263u;
+    // Tint rejects a `*` mixed with `^` unless both sides are parenthesized.
+    let mixed = (x * 374761393u) ^ (y * 668265263u);
     return (mixed >> 16u) & 0xffu;
 }
