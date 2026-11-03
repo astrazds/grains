@@ -240,10 +240,7 @@ impl Gpu {
         };
         match current {
             wgpu::CurrentSurfaceTexture::Success(frame) => {
-                self.paint(&frame.texture, grid, &paint);
-                if let Some(ui) = ui {
-                    self.draw_egui(&frame.texture, ui);
-                }
+                self.paint(&frame.texture, grid, &paint, ui);
                 window.pre_present_notify();
                 self.queue.present(frame);
             }
@@ -325,7 +322,7 @@ impl Gpu {
         );
         let surface = surface.map(|surface| {
             let config = wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: surface_usage(),
                 format,
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: size.width,
@@ -411,7 +408,13 @@ impl Gpu {
         self.reconfigure();
     }
 
-    fn paint(&mut self, texture: &wgpu::Texture, grid: &Grid, input: &Paint) {
+    fn paint(
+        &mut self,
+        texture: &wgpu::Texture,
+        grid: &Grid,
+        input: &Paint,
+        ui: Option<EguiFrame>,
+    ) {
         if !self.seeded {
             self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
             self.front = 0;
@@ -423,7 +426,7 @@ impl Gpu {
         }
         if self.hold {
             self.hold = false;
-            self.present(texture, self.front, input.bloom);
+            self.present(texture, self.front, input.bloom, ui);
             return;
         }
         if input.clear {
@@ -442,7 +445,7 @@ impl Gpu {
             self.apply_brush(stroke);
         }
         if input.paused {
-            self.present(texture, self.front, input.bloom);
+            self.present(texture, self.front, input.bloom, ui);
             return;
         }
         for _ in 0..input.passes {
@@ -450,22 +453,132 @@ impl Gpu {
             self.step(offset);
             self.passes += 1;
         }
-        self.present(texture, self.front, input.bloom);
+        self.present(texture, self.front, input.bloom, ui);
     }
 
-    fn present(&mut self, texture: &wgpu::Texture, index: usize, bloom: bool) {
+    fn present(
+        &mut self,
+        texture: &wgpu::Texture,
+        index: usize,
+        bloom: bool,
+        ui: Option<EguiFrame>,
+    ) {
+        if let Some(ui) = &ui {
+            let mut uploads = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            self.prepare_egui(&mut uploads, ui);
+            self.queue.submit([uploads.finish()]);
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        if bloom {
-            self.draw_bloom(&mut encoder, texture, index, true);
-        } else {
-            self.draw_bloom(&mut encoder, texture, index, false);
+        self.draw_bloom(&mut encoder, texture, index, bloom);
+        if let Some(ui) = ui {
+            self.paint_egui(&mut encoder, texture, &ui);
         }
+        #[cfg(target_arch = "wasm32")]
+        let probe = self.record_probe(&mut encoder, texture);
         self.queue.submit([encoder.finish()]);
+        #[cfg(target_arch = "wasm32")]
+        self.finish_probe(probe, texture.clone());
     }
 
-    fn draw_egui(&mut self, texture: &wgpu::Texture, ui: EguiFrame) {
+    // `?probe=1` copies three canvas pixels into `window.grainsPixels`.
+    // Screenshots of a WebGPU canvas stay empty, so the smoke test reads these.
+    #[cfg(target_arch = "wasm32")]
+    fn record_probe(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) -> Vec<(&'static str, wgpu::Buffer)> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let frame = N.fetch_add(1, Ordering::Relaxed);
+        if !crate::web::probe() || frame < 2 || PROBE_BUSY.swap(true, Ordering::Relaxed) {
+            return Vec::new();
+        }
+        web_sys::console::log_1(&format!("probe copy {frame}").into());
+        let spots = [
+            (8u32, 8u32, "corner"),
+            (120, 180, "panel"),
+            (748, 348, "stroke"),
+        ];
+        let mut buffers = Vec::new();
+        for (x, y, name) in spots {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("probe"),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            buffers.push((name, buffer));
+        }
+        buffers
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn finish_probe(&self, buffers: Vec<(&'static str, wgpu::Buffer)>, texture: wgpu::Texture) {
+        if buffers.is_empty() {
+            return;
+        }
+        let report = std::rc::Rc::new(std::cell::RefCell::new(js_sys::Object::new()));
+        let left = std::rc::Rc::new(std::cell::Cell::new(buffers.len()));
+        for (name, buffer) in buffers {
+            let mapped = buffer.clone();
+            let report = std::rc::Rc::clone(&report);
+            let left = std::rc::Rc::clone(&left);
+            let keep = texture.clone();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    drop(keep);
+                    if let Ok(()) = result
+                        && let Ok(view) = mapped.slice(..).get_mapped_range()
+                    {
+                        let array = js_sys::Array::new();
+                        for byte in &view[..4] {
+                            array.push(&wasm_bindgen::JsValue::from(u32::from(*byte)));
+                        }
+                        let _ = js_sys::Reflect::set(&report.borrow(), &name.into(), &array);
+                    }
+                    if left.get() == 1 {
+                        if let Some(window) = web_sys::window() {
+                            let _ = js_sys::Reflect::set(
+                                &window,
+                                &"grainsPixels".into(),
+                                &report.borrow(),
+                            );
+                        }
+                        PROBE_BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    left.set(left.get().saturating_sub(1));
+                });
+        }
+    }
+
+    fn prepare_egui(&mut self, encoder: &mut wgpu::CommandEncoder, ui: &EguiFrame) {
         if self.egui.is_none() {
             self.egui = Some(egui_wgpu::Renderer::new(
                 &self.device,
@@ -475,19 +588,29 @@ impl Gpu {
         }
         let device = self.device.clone();
         let queue = self.queue.clone();
+        let screen = self.egui_screen(ui);
         let renderer = self.egui.as_mut().unwrap();
         for (id, images) in &ui.textures.set {
             for image in images {
                 renderer.update_texture(&device, &queue, *id, image);
             }
         }
-        let screen = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.size.width, self.size.height],
-            pixels_per_point: ui.pixels_per_point.max(0.1),
-        };
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let _ = renderer.update_buffers(&device, &queue, &mut encoder, &ui.primitives, &screen);
+        let _ = renderer.update_buffers(&device, &queue, encoder, &ui.primitives, &screen);
+    }
+
+    fn paint_egui(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        ui: &EguiFrame,
+    ) {
+        let screen = self.egui_screen(ui);
+        // Solid rects in the panel sample egui's font atlas at uv 0. On web that
+        // sample stays empty, so the window never covers the sky. Draw the vertex
+        // colors first; the textured pass then adds glyphs when the atlas is ready.
+        #[cfg(target_arch = "wasm32")]
+        self.draw_widget_colors(encoder, texture, ui);
+        let renderer = self.egui.as_mut().unwrap();
         {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let mut pass = encoder
@@ -511,9 +634,94 @@ impl Gpu {
             renderer.render(&mut pass, &ui.primitives, &screen);
             drop(pass);
         }
-        queue.submit([encoder.finish()]);
         for id in &ui.textures.free {
             renderer.free_texture(id);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn draw_widget_colors(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        ui: &EguiFrame,
+    ) {
+        let mut vertices: Vec<u8> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut base = 0u32;
+        for prim in &ui.primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
+                continue;
+            };
+            vertices.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+            indices.extend(mesh.indices.iter().map(|index| index + base));
+            base += mesh.vertices.len() as u32;
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let pipeline = widget_color_pipeline(&self.device, self.format);
+        let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("widget-screen"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let screen = [self.size.width as f32, self.size.height as f32, 0.0, 0.0];
+        self.queue
+            .write_buffer(&uniform, 0, bytemuck::cast_slice(&screen));
+        let layout = pipeline.get_bind_group_layout(0);
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("widget-screen"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("widget-vertices"),
+            size: vertices.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("widget-indices"),
+            size: (indices.len() * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&vertex_buffer, 0, &vertices);
+        self.queue
+            .write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("widgets"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+    }
+
+    fn egui_screen(&self, ui: &EguiFrame) -> egui_wgpu::ScreenDescriptor {
+        egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.size.width, self.size.height],
+            pixels_per_point: ui.pixels_per_point.max(0.1),
         }
     }
 
@@ -1767,6 +1975,108 @@ fn letterbox_color() -> wgpu::Color {
         b: f64::from(LETTERBOX[2]) / 255.0,
         a: f64::from(LETTERBOX[3]) / 255.0,
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+static PROBE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "wasm32")]
+fn widget_color_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    use std::cell::RefCell;
+    thread_local! {
+        static PIPE: RefCell<Option<wgpu::RenderPipeline>> = const { RefCell::new(None) };
+    }
+    PIPE.with(|slot| {
+        if slot.borrow().is_none() {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("widgets"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/widgets.wgsl").into()),
+            });
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("widget-screen"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("widgets"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let vertex_layout = wgpu::VertexBufferLayout {
+                array_stride: 20,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 8,
+                        shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Unorm8x4,
+                        offset: 16,
+                        shader_location: 2,
+                    },
+                ],
+            };
+            *slot.borrow_mut() = Some(device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("widgets"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(vertex_layout)],
+                    },
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: 1,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                },
+            ));
+        }
+        slot.borrow().clone().unwrap()
+    })
+}
+
+fn surface_usage() -> wgpu::TextureUsages {
+    let usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    #[cfg(target_arch = "wasm32")]
+    if crate::web::probe() {
+        return usage | wgpu::TextureUsages::COPY_SRC;
+    }
+    usage
 }
 
 fn color_attachment(
