@@ -592,12 +592,16 @@ impl App {
 
     fn load_world(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        match std::fs::read(world::FILE_NAME) {
+        match world::read_file() {
             Ok(bytes) => self.apply_file(&bytes),
             Err(err) => self.set_notice(format!("could not load {}: {err}", world::FILE_NAME)),
         }
         #[cfg(target_arch = "wasm32")]
-        web::pick_file(Rc::clone(&self.inbox));
+        {
+            // A slower read from an earlier picker must not replace this selection.
+            self.inbox = Rc::new(RefCell::new(None));
+            web::pick_file(Rc::clone(&self.inbox));
+        }
     }
 
     fn share_world(&mut self) {
@@ -641,6 +645,18 @@ impl App {
         if let Err(err) = self.grid.place(saved.width, saved.height, &saved.words) {
             self.set_notice(err);
             return;
+        }
+        if saved.width as usize != self.grid.width() || saved.height as usize != self.grid.height()
+        {
+            let view = self
+                .window
+                .as_ref()
+                .map(|window| frame_size(window, window.inner_size()))
+                .unwrap_or(Size {
+                    width: 1024,
+                    height: 600,
+                });
+            self.camera = Camera::centered(saved.width, saved.height, view.width, view.height);
         }
         if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
             gpu.store(&self.grid);
@@ -715,7 +731,7 @@ fn write_file(words: &[u32]) -> String {
         crate::grid::world_size().0 as u32,
         crate::grid::world_size().1 as u32,
     ) {
-        Ok(bytes) => match std::fs::write(world::FILE_NAME, bytes) {
+        Ok(bytes) => match world::replace_file(std::path::Path::new("."), &bytes) {
             Ok(()) => format!("saved {}", world::FILE_NAME),
             Err(err) => format!("could not save {}: {err}", world::FILE_NAME),
         },
@@ -725,13 +741,7 @@ fn write_file(words: &[u32]) -> String {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn native_link(words: &[u32]) -> String {
-    match world::encode(
-        words,
-        crate::grid::world_size().0 as u32,
-        crate::grid::world_size().1 as u32,
-    )
-    .and_then(|bytes| world::hash_fragment(&bytes))
-    {
+    match world::desktop_fragment(words) {
         Ok(fragment) => {
             eprintln!("link #{fragment}");
             "printed a link for this world".to_string()

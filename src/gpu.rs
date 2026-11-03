@@ -1185,6 +1185,9 @@ impl Gpu {
     pub(crate) fn store(&mut self, grid: &Grid) {
         self.queue
             .write_buffer(&self.cells[self.front], 0, grid.as_bytes());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.clear_buffer(&self.particles, 0, None);
+        self.queue.submit([encoder.finish()]);
         self.seeded = true;
         self.hold = true;
     }
@@ -2630,6 +2633,17 @@ mod tests {
         eprintln!("asserted 400x200 byte length = {}", frame.len());
         asserted(400, 200, &frame, 0, 0, [0x0b, 0x02, 0x03, 0xFF]);
         asserted(400, 200, &frame, 0, 1, [0x10, 0x20, 0x30, 0xFF]);
+    }
+
+    #[test]
+    fn loading_discards_airborne_grains_from_the_previous_world() {
+        let Some(mut gpu) = open_world(&blast_scene(), 2, false) else {
+            return;
+        };
+        assert!(gpu.read_specks().iter().any(|speck| speck.word != 0));
+        let empty = crate::grid::Grid::from_fn(|_, _| Cell::pack(0, 0, 0, 0));
+        gpu.store(&empty);
+        assert!(gpu.read_specks().iter().all(|speck| speck.word == 0));
     }
 
     #[test]

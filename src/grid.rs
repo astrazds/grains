@@ -2,11 +2,12 @@ pub const GRID_WIDTH: usize = 512;
 pub const GRID_HEIGHT: usize = 288;
 pub const CELL_COUNT: usize = GRID_WIDTH * GRID_HEIGHT;
 pub const CHUNK: usize = 64;
+pub const WEB_WORLD: (usize, usize) = (1024, 576);
 
 pub fn world_size() -> (usize, usize) {
     #[cfg(target_arch = "wasm32")]
     {
-        (1024, 576)
+        WEB_WORLD
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
