@@ -15,7 +15,11 @@ pub const STONE: u8 = 2;
 pub const WATER: u8 = 3;
 pub const OIL: u8 = 4;
 pub const SMOKE: u8 = 5;
-pub const MATERIAL_COUNT: usize = 6;
+pub const WOOD: u8 = 6;
+pub const FIRE: u8 = 7;
+pub const STEAM: u8 = 8;
+pub const MATERIAL_COUNT: usize = 9;
+pub const KEEP: u32 = 255;
 
 pub const KIND_EMPTY: u32 = 0;
 pub const KIND_SOLID: u32 = 1;
@@ -29,28 +33,58 @@ pub struct MaterialInfo {
     pub density: u32,
     pub kind: u32,
     pub life: u32,
-    pub _pad: u32,
+    pub becomes: u32,
     pub colour: [f32; 4],
 }
 
-const fn info(density: u32, kind: u32, life: u32, colour: [f32; 4]) -> MaterialInfo {
+const fn info(density: u32, kind: u32, life: u32, becomes: u32, colour: [f32; 4]) -> MaterialInfo {
     MaterialInfo {
         density,
         kind,
         life,
-        _pad: 0,
+        becomes,
         colour,
     }
 }
 
 pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
-    info(0, KIND_EMPTY, 0, [0.0, 0.0, 0.0, 1.0]),
-    info(4, KIND_POWDER, 0, [0.86, 0.72, 0.38, 1.0]),
-    info(5, KIND_SOLID, 0, [0.45, 0.47, 0.50, 1.0]),
-    info(3, KIND_LIQUID, 0, [0.25, 0.45, 0.85, 1.0]),
-    info(2, KIND_LIQUID, 0, [0.55, 0.35, 0.12, 1.0]),
-    info(1, KIND_GAS, 255, [0.75, 0.75, 0.78, 1.0]),
+    info(0, KIND_EMPTY, 0, EMPTY as u32, [0.0, 0.0, 0.0, 1.0]),
+    info(4, KIND_POWDER, 0, EMPTY as u32, [0.86, 0.72, 0.38, 1.0]),
+    info(5, KIND_SOLID, 0, EMPTY as u32, [0.45, 0.47, 0.50, 1.0]),
+    info(3, KIND_LIQUID, 0, EMPTY as u32, [0.25, 0.45, 0.85, 1.0]),
+    info(2, KIND_LIQUID, 0, EMPTY as u32, [0.55, 0.35, 0.12, 1.0]),
+    info(1, KIND_GAS, 255, EMPTY as u32, [0.75, 0.75, 0.78, 1.0]),
+    info(5, KIND_SOLID, 0, EMPTY as u32, [0.42, 0.26, 0.12, 1.0]),
+    info(1, KIND_GAS, 24, SMOKE as u32, [0.95, 0.35, 0.08, 1.0]),
+    info(1, KIND_GAS, 32, WATER as u32, [0.82, 0.88, 0.92, 1.0]),
 ];
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Reaction {
+    pub a: u32,
+    pub b: u32,
+}
+
+const fn pair(a: u32, b: u32) -> Reaction {
+    Reaction { a, b }
+}
+
+const fn reaction_table() -> [Reaction; MATERIAL_COUNT * MATERIAL_COUNT] {
+    let mut table = [pair(KEEP, KEEP); MATERIAL_COUNT * MATERIAL_COUNT];
+    table[WOOD as usize * MATERIAL_COUNT + FIRE as usize] = pair(FIRE as u32, KEEP);
+    table[FIRE as usize * MATERIAL_COUNT + WOOD as usize] = pair(KEEP, FIRE as u32);
+    table[WATER as usize * MATERIAL_COUNT + FIRE as usize] = pair(STEAM as u32, EMPTY as u32);
+    table[FIRE as usize * MATERIAL_COUNT + WATER as usize] = pair(EMPTY as u32, STEAM as u32);
+    table
+}
+
+pub static REACTIONS: [Reaction; MATERIAL_COUNT * MATERIAL_COUNT] = reaction_table();
+
+#[cfg(test)]
+pub fn reaction(a: u8, b: u8) -> Reaction {
+    REACTIONS[a as usize * MATERIAL_COUNT + b as usize]
+}
 
 const _: () = assert!(std::mem::size_of::<MaterialInfo>() == 32);
 
@@ -71,6 +105,9 @@ pub fn material_name(id: u8) -> &'static str {
         WATER => "water",
         OIL => "oil",
         SMOKE => "smoke",
+        WOOD => "wood",
+        FIRE => "fire",
+        STEAM => "steam",
         _ => "other",
     }
 }
@@ -255,6 +292,29 @@ mod tests {
         assert_eq!(MATERIALS[OIL as usize].kind, KIND_LIQUID);
         assert_eq!(MATERIALS[SMOKE as usize].kind, KIND_GAS);
         assert_eq!(MATERIALS[SMOKE as usize].life, 255);
+        assert_eq!(MATERIALS[super::WOOD as usize].kind, KIND_SOLID);
+        assert_eq!(MATERIALS[super::FIRE as usize].becomes, SMOKE as u32);
+        assert_eq!(MATERIALS[super::STEAM as usize].becomes, WATER as u32);
+        assert_eq!(
+            super::reaction(super::WOOD, super::FIRE).a,
+            super::FIRE as u32
+        );
+        assert_eq!(
+            super::reaction(super::WATER, super::FIRE).a,
+            super::STEAM as u32
+        );
+        assert_eq!(
+            super::reaction(super::FIRE, super::WATER).a,
+            super::EMPTY as u32
+        );
+        assert_eq!(super::reaction(super::SAND, super::FIRE).a, super::KEEP);
+        assert_eq!(super::reaction(super::STONE, super::FIRE).a, super::KEEP);
+        let sim = include_str!("../shaders/sim.wgsl");
+        let draw = include_str!("../shaders/draw.wgsl");
+        let count = format!("const MATERIAL_COUNT: u32 = {}u;", super::MATERIAL_COUNT);
+        let draw_count = format!("material < {}u", super::MATERIAL_COUNT);
+        assert!(sim.contains(&count), "{count}");
+        assert!(draw.contains(&draw_count), "{draw_count}");
     }
 
     #[test]
