@@ -25,7 +25,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use gpu::{Gpu, Paint, Stroke};
-use grid::{EMPTY, OIL, SAND, SMOKE, STONE, WATER, material_name, spawn_word};
+use grid::{EMPTY, FIRE, OIL, SAND, SMOKE, STEAM, STONE, WATER, WOOD, material_name, spawn_word};
 
 const RADIUS_MAX: i32 = 48;
 const PASSES_MAX: u32 = 16;
@@ -201,6 +201,9 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Digit4) => self.set_material(WATER),
                     PhysicalKey::Code(KeyCode::Digit5) => self.set_material(OIL),
                     PhysicalKey::Code(KeyCode::Digit6) => self.set_material(SMOKE),
+                    PhysicalKey::Code(KeyCode::Digit7) => self.set_material(WOOD),
+                    PhysicalKey::Code(KeyCode::Digit8) => self.set_material(FIRE),
+                    PhysicalKey::Code(KeyCode::Digit9) => self.set_material(STEAM),
                     PhysicalKey::Code(KeyCode::Minus)
                     | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
                         self.passes = self.passes.saturating_sub(1).max(1);

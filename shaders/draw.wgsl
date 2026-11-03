@@ -18,7 +18,7 @@ struct MaterialInfo {
     density: u32,
     kind: u32,
     life: u32,
-    _pad: u32,
+    becomes: u32,
     colour: vec4<f32>,
 }
 
@@ -58,7 +58,7 @@ fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let variation = (word >> VARIATION_SHIFT) & 0xffu;
     let life = (word >> LIFE_SHIFT) & 0xffu;
     let _flags = (word >> FLAGS_SHIFT) & 0xffu;
-    if (material < 6u) {
+    if (material < 9u) {
         let colour = materials[material].colour;
         if (materials[material].kind == 4u) {
             return vec4<f32>(colour.rgb * (f32(life) / 255.0), 1.0);

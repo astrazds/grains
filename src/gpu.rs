@@ -39,6 +39,9 @@ pub(crate) struct Gpu {
     // Bind groups borrow this buffer. The field keeps it alive.
     #[allow(dead_code)]
     materials: wgpu::Buffer,
+    // Bind groups borrow this buffer. The field keeps it alive.
+    #[allow(dead_code)]
+    reactions: wgpu::Buffer,
 }
 
 struct Surface {
@@ -228,6 +231,11 @@ impl Gpu {
             0,
             bytemuck::cast_slice(&crate::grid::MATERIALS),
         );
+        queue.write_buffer(
+            &gpu_parts.reactions,
+            0,
+            bytemuck::cast_slice(&crate::grid::REACTIONS),
+        );
         let surface = surface.map(|surface| {
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -267,6 +275,7 @@ impl Gpu {
             brush_groups: gpu_parts.brush_groups,
             brush_pipeline: gpu_parts.brush_pipeline,
             materials: gpu_parts.materials,
+            reactions: gpu_parts.reactions,
         })
     }
 
@@ -639,6 +648,7 @@ struct Parts {
     brush_groups: [wgpu::BindGroup; 2],
     brush_pipeline: wgpu::ComputePipeline,
     materials: wgpu::Buffer,
+    reactions: wgpu::Buffer,
 }
 
 fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
@@ -668,6 +678,12 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         label: None,
         size: (crate::grid::MATERIAL_COUNT * std::mem::size_of::<crate::grid::MaterialInfo>())
             as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let reactions = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (crate::grid::REACTIONS.len() * std::mem::size_of::<crate::grid::Reaction>()) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -819,6 +835,16 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     let sim_groups = [0, 1].map(|index| {
@@ -854,6 +880,14 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                     binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &materials,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &reactions,
                         offset: 0,
                         size: None,
                     }),
@@ -962,6 +996,7 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         brush_groups,
         brush_pipeline,
         materials,
+        reactions,
     }
 }
 
@@ -1064,7 +1099,7 @@ mod tests {
         let grid = crate::grid::Grid::from_fn(|x, y| match (x, y) {
             (0, 0) => Cell::pack(0x10, 0x20, 0x30, 0x40),
             (1, 0) => Cell::pack(0, 0, 0, 0),
-            (56, 44) => Cell::pack(0x07, 0x02, 0x03, 0x04),
+            (56, 44) => Cell::pack(0x0b, 0x02, 0x03, 0x04),
             (56, 45) => Cell::pack(0x10, 0x20, 0x30, 0x00),
             _ => Cell::pack(0, 0, 0, 0),
         });
@@ -1127,7 +1162,7 @@ mod tests {
         };
         assert_eq!(frame.len(), 400 * 200 * 4);
         eprintln!("asserted 400x200 byte length = {}", frame.len());
-        asserted(400, 200, &frame, 0, 0, [0x07, 0x02, 0x03, 0xFF]);
+        asserted(400, 200, &frame, 0, 0, [0x0b, 0x02, 0x03, 0xFF]);
         asserted(400, 200, &frame, 0, 1, [0x10, 0x20, 0x30, 0xFF]);
     }
 
@@ -1494,6 +1529,67 @@ mod tests {
         );
         assert!(count_material(&cells, SMOKE) < count_material(&before, SMOKE));
         eprintln!("asserted sand water oil and stone counts held");
+    }
+
+    #[test]
+    fn fire_burns_through_wood_and_leaves_smoke() {
+        use crate::grid::{EMPTY, FIRE, SMOKE, WOOD};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for x in 10..=13 {
+            grid.set(x, 30, Cell::pack(WOOD, 0, 0, 0));
+        }
+        grid.set(9, 30, Cell::pack(FIRE, 0, 24, 0));
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 60)) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, WOOD), 0);
+        assert_eq!(count_material(&cells, FIRE), 0);
+        assert!(count_material(&cells, SMOKE) > 0);
+        eprintln!("asserted wood burned out and left smoke");
+    }
+
+    #[test]
+    fn water_puts_out_fire_and_makes_steam() {
+        use crate::grid::{EMPTY, FIRE, STEAM, STONE, WATER};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(15, 21, Cell::pack(STONE, 0, 0, 0));
+        grid.set(16, 21, Cell::pack(STONE, 0, 0, 0));
+        grid.set(15, 20, Cell::pack(FIRE, 0, 24, 0));
+        grid.set(16, 20, Cell::pack(WATER, 0, 0, 0));
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 8)) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, FIRE), 0);
+        assert_eq!(count_material(&cells, WATER), 0);
+        assert!(count_material(&cells, STEAM) > 0);
+        let steam_y = (0..crate::grid::GRID_HEIGHT)
+            .find(|y| (0..crate::grid::GRID_WIDTH).any(|x| material_at(&cells, x, *y) == STEAM))
+            .unwrap();
+        assert!(steam_y < 20, "steam stayed at {steam_y}");
+        eprintln!("asserted water became steam and the fire went out");
+    }
+
+    #[test]
+    fn stone_and_sand_do_not_burn() {
+        use crate::grid::{EMPTY, FIRE, SAND, STONE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(9, 31, Cell::pack(STONE, 0, 0, 0));
+        grid.set(10, 31, Cell::pack(STONE, 0, 0, 0));
+        grid.set(11, 31, Cell::pack(STONE, 0, 0, 0));
+        grid.set(9, 30, Cell::pack(STONE, 0, 0, 0));
+        grid.set(10, 30, Cell::pack(SAND, 0, 0, 0));
+        grid.set(11, 30, Cell::pack(FIRE, 0, 24, 0));
+        grid.set(12, 30, Cell::pack(STONE, 0, 0, 0));
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 40)) else {
+            return;
+        };
+        assert_eq!(material_at(&cells, 10, 30), SAND);
+        assert_eq!(material_at(&cells, 9, 30), STONE);
+        assert_eq!(material_at(&cells, 10, 31), STONE);
+        assert_eq!(material_at(&cells, 12, 30), STONE);
+        assert_eq!(count_material(&cells, SAND), 1);
+        assert_eq!(count_material(&cells, STONE), 5);
+        eprintln!("asserted sand and stone stayed next to fire");
     }
 
     fn count_material(cells: &[Cell], material: u8) -> usize {
