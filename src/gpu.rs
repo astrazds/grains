@@ -502,7 +502,7 @@ impl Gpu {
         let spots = [
             (8u32, 8u32, "corner"),
             (120, 180, "panel"),
-            (700, 300, "stroke"),
+            (748, 348, "stroke"),
         ];
         let mut buffers = Vec::new();
         for (x, y, name) in spots {
