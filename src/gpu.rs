@@ -1058,6 +1058,9 @@ impl Gpu {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        if stroke.clear != 0 {
+            encoder.clear_buffer(&self.particles, 0, None);
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
@@ -1858,6 +1861,7 @@ fn resources(
                 count: None,
             },
             storage_entry(5),
+            storage_entry(6),
         ],
     });
     let blast_groups = [0, 1].map(|index| {
@@ -1871,6 +1875,7 @@ fn resources(
                 buffer_entry(3, &claims),
                 buffer_entry(4, &sim_uniform),
                 buffer_entry(5, &chunk_list),
+                buffer_entry(6, &dirty),
             ],
         })
     });
@@ -2870,6 +2875,100 @@ mod tests {
                 .iter()
                 .any(|cell| cell.material() == WATER)
         );
+    }
+
+    fn moving_grain() -> super::Speck {
+        super::Speck {
+            x: 8.5,
+            y: 2.5,
+            vx: 0.0,
+            vy: 0.0,
+            word: crate::grid::SAND.into(),
+            age: 0,
+            _pad0: 0,
+            _pad1: 0,
+        }
+    }
+
+    #[test]
+    fn sim_regression_grains_escape_a_solid_ceiling() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let grid = crate::grid::Grid::filled(16, 16, |_, y| {
+            Cell::pack(if y < 2 { STONE } else { EMPTY }, 0, 0, 0)
+        });
+        let Some(mut gpu) = open_world(&grid, 0, true) else {
+            return;
+        };
+        let speck = super::Speck {
+            x: 8.5,
+            y: 0.5,
+            age: 7,
+            ..moving_grain()
+        };
+        gpu.queue
+            .write_buffer(&gpu.particles, 0, bytemuck::bytes_of(&speck));
+        for pass in 0..32 {
+            gpu.step(pass % 2);
+        }
+        assert_eq!(count_material(&gpu.read_cells(gpu.front), SAND), 1);
+    }
+
+    #[test]
+    fn sim_regression_grains_land_on_stone_at_the_world_edge() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let grid = crate::grid::Grid::filled(16, 16, |_, y| {
+            Cell::pack(if y == 15 { STONE } else { EMPTY }, 0, 0, 0)
+        });
+        let Some(mut gpu) = open_world(&grid, 0, true) else {
+            return;
+        };
+        let speck = super::Speck {
+            x: 15.5,
+            y: 14.5,
+            vy: 1.0,
+            age: 7,
+            ..moving_grain()
+        };
+        gpu.queue
+            .write_buffer(&gpu.particles, 0, bytemuck::bytes_of(&speck));
+        for pass in 0..12 {
+            gpu.step(pass % 2);
+        }
+        assert_eq!(gpu.read_cells(gpu.front)[14 * 16 + 15].material(), SAND);
+    }
+
+    #[test]
+    fn sim_regression_airborne_grains_keep_chunks_awake() {
+        use crate::grid::{EMPTY, SAND};
+        let grid = crate::grid::Grid::filled(16, 16, |_, _| Cell::pack(EMPTY, 0, 0, 0));
+        let Some(mut gpu) = open_world(&grid, 0, true) else {
+            return;
+        };
+        gpu.queue
+            .write_buffer(&gpu.particles, 0, bytemuck::bytes_of(&moving_grain()));
+        for pass in 0..16 {
+            gpu.step(pass % 2);
+        }
+        assert_eq!(count_material(&gpu.read_cells(gpu.front), SAND), 1);
+    }
+
+    #[test]
+    fn sim_regression_clearing_discards_airborne_grains() {
+        let Some(mut gpu) = open_world(&blast_scene(), 2, true) else {
+            return;
+        };
+        assert!(gpu.read_specks().iter().any(|speck| speck.word != 0));
+        gpu.apply_brush(super::Stroke {
+            from_x: 0,
+            from_y: 0,
+            to_x: 0,
+            to_y: 0,
+            radius: 0,
+            material: 0,
+            erase: 0,
+            clear: 1,
+        });
+        assert!(gpu.read_specks().iter().all(|speck| speck.word == 0));
     }
 
     #[test]

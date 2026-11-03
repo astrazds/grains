@@ -38,6 +38,12 @@ struct Particle {
 @group(0) @binding(4) var<uniform> world: World;
 @group(0) @binding(5) var<storage, read_write> chunks: array<u32>;
 
+@group(0) @binding(6) var<storage, read_write> dirty: array<atomic<u32>>;
+
+fn mark_dirty(x: u32, y: u32) {
+    atomicOr(&dirty[(y / CHUNK) * world.chunk_cols + x / CHUNK], 1u);
+}
+
 fn material_of(word: u32) -> u32 {
     return word & 0xffu;
 }
@@ -195,6 +201,9 @@ fn fly(@builtin(global_invocation_id) id: vec3<u32>) {
     if (speck.word == 0u) {
         return;
     }
+    // Flight is stored at the launch cell until landing. Keep its chunk
+    // and the moving destination awake even when the grid itself is still.
+    mark_dirty(x, y);
     speck.vy = speck.vy + 0.16;
     speck.x = speck.x + speck.vx;
     speck.y = speck.y + speck.vy;
@@ -209,8 +218,9 @@ fn fly(@builtin(global_invocation_id) id: vec3<u32>) {
         speck.y = 0.5;
         speck.vy = 0.0;
     }
-    speck.x = clamp(speck.x, 0.5, f32(world.width) - 1.5);
-    speck.y = clamp(speck.y, 0.5, f32(world.height) - 1.5);
+    speck.x = clamp(speck.x, 0.5, f32(world.width) - 0.5);
+    speck.y = clamp(speck.y, 0.5, f32(world.height) - 0.5);
+    mark_dirty(u32(floor(speck.x)), u32(floor(speck.y)));
     particles[here] = speck;
 }
 
@@ -236,8 +246,8 @@ fn claim(@builtin(global_invocation_id) id: vec3<u32>) {
     if (speck.word == 0u || speck.age < 8u) {
         return;
     }
-    let x = i32(floor(speck.x + 0.5));
-    let y = i32(floor(speck.y + 0.5));
+    let x = i32(floor(speck.x));
+    let y = i32(floor(speck.y));
     if (!inside(x, y)) {
         return;
     }
@@ -261,6 +271,7 @@ fn land(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     settled[here] = word;
+    mark_dirty(x, y);
     particles[slot].word = 0u;
     particles[slot].vx = 0.0;
     particles[slot].vy = 0.0;
@@ -278,8 +289,8 @@ fn nudge(@builtin(global_invocation_id) id: vec3<u32>) {
     if (speck.word == 0u || speck.age < 8u) {
         return;
     }
-    let x = i32(floor(speck.x + 0.5));
-    let y = i32(floor(speck.y + 0.5));
+    let x = i32(floor(speck.x));
+    let y = i32(floor(speck.y));
     if (!inside(x, y)) {
         return;
     }
@@ -288,7 +299,28 @@ fn nudge(@builtin(global_invocation_id) id: vec3<u32>) {
     if (won && !blocked) {
         return;
     }
-    speck.x = clamp(speck.x + 1.25, 0.5, f32(world.width) - 1.5);
-    speck.y = clamp(speck.y + 0.4, 0.5, f32(world.height) - 1.5);
+    // Look both ways in this column so a thick floor or ceiling cannot
+    // trap a grain. If the whole column is full, try the next one next pass.
+    var retry_x = (u32(x) + 1u) % world.width;
+    var retry_y = y;
+    for (var distance = 1; distance < i32(world.height); distance++) {
+        let above = y - distance;
+        let below = y + distance;
+        if (above >= 0 && material_of(settled[index_at(x, above)]) == EMPTY) {
+            retry_x = u32(x);
+            retry_y = above;
+            break;
+        }
+        if (below < i32(world.height) && material_of(settled[index_at(x, below)]) == EMPTY) {
+            retry_x = u32(x);
+            retry_y = below;
+            break;
+        }
+    }
+    speck.x = f32(retry_x) + 0.5;
+    speck.y = f32(retry_y) + 0.5;
+    speck.vx = 0.0;
+    speck.vy = 0.0;
+    mark_dirty(retry_x, u32(retry_y));
     particles[here] = speck;
 }
