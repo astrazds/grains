@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -30,7 +30,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use gpu::{EguiFrame, Gpu, Paint, Stroke};
 
 type Inbox = Rc<RefCell<Option<Result<Vec<u8>, String>>>>;
-use grid::material_name;
+use grid::{Camera, material_name};
 use ui::{Controls, PASSES_MAX, RADIUS_MAX};
 
 struct App {
@@ -49,6 +49,10 @@ struct App {
     notice: Rc<RefCell<String>>,
     inbox: Inbox,
     link_checked: bool,
+    camera: Camera,
+    panning: bool,
+    pan_last: Option<(f64, f64)>,
+    modifiers: Modifiers,
 }
 
 pub fn run() {
@@ -59,7 +63,7 @@ pub fn run() {
     let app = App {
         window: None,
         gpu: Rc::new(std::cell::RefCell::new(None)),
-        grid: Grid::demo(),
+        grid: Grid::demo_world(),
         controls: Controls::new(),
         over_panel: false,
         fps: 0.0,
@@ -72,6 +76,13 @@ pub fn run() {
         notice: Rc::new(RefCell::new(String::new())),
         inbox: Rc::new(RefCell::new(None)),
         link_checked: false,
+        camera: {
+            let (width, height) = grid::world_size();
+            Camera::centered(width as u32, height as u32, 1024, 600)
+        },
+        panning: false,
+        pan_last: None,
+        modifiers: Modifiers::default(),
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -197,15 +208,36 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(&window),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             WindowEvent::CursorMoved { position, .. } => {
+                if self.panning {
+                    if let Some((last_x, last_y)) = self.pan_last {
+                        let (width, height) = grid::world_size();
+                        self.camera.pan(
+                            (position.x - last_x) as f32,
+                            (position.y - last_y) as f32,
+                            width as u32,
+                            height as u32,
+                            0,
+                            0,
+                        );
+                    }
+                    self.pan_last = Some((position.x, position.y));
+                }
                 self.cursor = Some((position.x, position.y));
             }
             WindowEvent::MouseInput { state, button, .. } if !consumed => {
                 let down = state == ElementState::Pressed;
+                let shift = self.modifiers.state().shift_key();
                 match button {
                     MouseButton::Left => self.painting = down,
-                    MouseButton::Right => self.erasing = down,
+                    MouseButton::Middle => self.panning = down,
+                    MouseButton::Right if shift => self.erasing = down,
+                    MouseButton::Right => self.panning = down,
                     _ => {}
+                }
+                if !down && !self.panning {
+                    self.pan_last = None;
                 }
                 if !self.painting && !self.erasing {
                     self.last_cell = None;
@@ -216,12 +248,19 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(offset) => offset.y as f32 / 40.0,
                 };
-                if steps > 0.0 {
+                let flags = self.modifiers.state();
+                if flags.control_key() || flags.alt_key() || flags.super_key() {
+                    let factor = if steps > 0.0 { 1.1 } else { 0.9 };
+                    let (cursor_x, cursor_y) = self.cursor.unwrap_or((0.0, 0.0));
+                    self.camera
+                        .zoom_at(cursor_x as f32, cursor_y as f32, factor);
+                } else if steps > 0.0 {
                     self.controls.radius = (self.controls.radius + 1).min(RADIUS_MAX);
+                    self.log_brush();
                 } else if steps < 0.0 {
                     self.controls.radius = (self.controls.radius - 1).max(0);
+                    self.log_brush();
                 }
-                self.log_brush();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed || event.repeat {
@@ -345,6 +384,7 @@ impl App {
         let clear = self.controls.clear;
         self.controls.clear = false;
         if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
+            gpu.set_camera(self.camera);
             gpu.draw(
                 window,
                 &self.grid,
@@ -369,7 +409,13 @@ impl App {
         let fps = self.fps;
         let full = ctx.run_pass(input, |ctx| {
             let notice = self.notice.borrow().clone();
-            ui::show(ctx, &mut self.controls, fps, &notice);
+            let (awake, chunks) = self
+                .gpu
+                .borrow()
+                .as_ref()
+                .map(|gpu| gpu.chunk_stats())
+                .unwrap_or((0, 0));
+            ui::show(ctx, &mut self.controls, fps, &notice, awake, chunks);
             self.over_panel = ctx.is_pointer_over_egui();
         });
         let ui = self.egui.as_mut()?;
@@ -423,15 +469,18 @@ impl App {
             self.set_notice(write_file(&words));
         }
         #[cfg(target_arch = "wasm32")]
-        self.with_grid(
-            |words| match words.and_then(|words| world::encode(&words)) {
+        self.with_grid(|words| {
+            match words.and_then(|words| {
+                let (width, height) = grid::world_size();
+                world::encode(&words, width as u32, height as u32)
+            }) {
                 Ok(bytes) => match web::download(&bytes) {
                     Ok(()) => format!("saved {}", world::FILE_NAME),
                     Err(err) => err,
                 },
                 Err(err) => err,
-            },
-        );
+            }
+        });
     }
 
     fn load_world(&mut self) {
@@ -457,8 +506,11 @@ impl App {
             self.set_notice(native_link(&words));
         }
         #[cfg(target_arch = "wasm32")]
-        self.with_grid(
-            |words| match words.and_then(|words| world::encode(&words)) {
+        self.with_grid(|words| {
+            match words.and_then(|words| {
+                let (width, height) = grid::world_size();
+                world::encode(&words, width as u32, height as u32)
+            }) {
                 Ok(bytes) => match world::hash_fragment(&bytes) {
                     Ok(fragment) => match web::set_hash(&fragment) {
                         Ok(()) => "updated the link".to_string(),
@@ -467,21 +519,27 @@ impl App {
                     Err(err) => err,
                 },
                 Err(err) => err,
-            },
-        );
+            }
+        });
     }
 
     fn apply_file(&mut self, bytes: &[u8]) {
-        match world::decode(bytes).and_then(|words| grid::Grid::from_words(&words)) {
-            Ok(grid) => {
-                if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
-                    gpu.store(&grid);
-                }
-                self.grid = grid;
-                self.set_notice("loaded the world");
+        let saved = match world::decode(bytes) {
+            Ok(saved) => saved,
+            Err(err) => {
+                self.set_notice(err);
+                return;
             }
-            Err(err) => self.set_notice(err),
+        };
+        if let Err(err) = self.grid.place(saved.width, saved.height, &saved.words) {
+            self.set_notice(err);
+            return;
         }
+        if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
+            gpu.store(&self.grid);
+            gpu.wake_all();
+        }
+        self.set_notice("loaded the world");
     }
 
     fn set_notice(&self, text: impl Into<String>) {
@@ -511,15 +569,19 @@ impl App {
         });
     }
 
-    fn stroke_for(&mut self, window: &Window) -> Option<Stroke> {
+    fn stroke_for(&mut self, _window: &Window) -> Option<Stroke> {
         if self.over_panel || (!self.painting && !self.erasing) {
             self.last_cell = None;
             return None;
         }
-        let size = frame_size(window, window.inner_size());
-        let fit = letterbox(size)?;
         let (cursor_x, cursor_y) = self.cursor?;
-        let Some((x, y)) = cell_at(cursor_x.round() as i32, cursor_y.round() as i32, fit) else {
+        let Some((x, y)) = grid::cell_at_camera(
+            cursor_x as f32,
+            cursor_y as f32,
+            self.camera,
+            self.grid.width() as u32,
+            self.grid.height() as u32,
+        ) else {
             self.last_cell = None;
             return None;
         };
@@ -541,7 +603,11 @@ impl App {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn write_file(words: &[u32]) -> String {
-    match world::encode(words) {
+    match world::encode(
+        words,
+        crate::grid::world_size().0 as u32,
+        crate::grid::world_size().1 as u32,
+    ) {
         Ok(bytes) => match std::fs::write(world::FILE_NAME, bytes) {
             Ok(()) => format!("saved {}", world::FILE_NAME),
             Err(err) => format!("could not save {}: {err}", world::FILE_NAME),
@@ -552,7 +618,13 @@ fn write_file(words: &[u32]) -> String {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn native_link(words: &[u32]) -> String {
-    match world::encode(words).and_then(|bytes| world::hash_fragment(&bytes)) {
+    match world::encode(
+        words,
+        crate::grid::world_size().0 as u32,
+        crate::grid::world_size().1 as u32,
+    )
+    .and_then(|bytes| world::hash_fragment(&bytes))
+    {
         Ok(fragment) => {
             eprintln!("link #{fragment}");
             "printed a link for this world".to_string()

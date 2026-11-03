@@ -1,4 +1,5 @@
-use crate::grid::{CELL_COUNT, GRID_HEIGHT, GRID_WIDTH};
+const MAX_EDGE: u32 = 4096;
+const MAX_CELLS: usize = 4096 * 2048;
 
 pub const FILE_NAME: &str = "world.grains";
 pub const LINK_LIMIT: usize = 16_384;
@@ -6,7 +7,7 @@ pub const LINK_LIMIT: usize = 16_384;
 const MAGIC: &[u8; 4] = b"GRNS";
 const VERSION: u16 = 1;
 const HEADER: usize = 10;
-const MAX_FILE: usize = HEADER + CELL_COUNT * 8;
+const MAX_FILE: usize = HEADER + MAX_CELLS * 8;
 
 const NOT_WORLD: &str = "this is not a grains world";
 const CUT_OFF: &str = "this world file is cut off";
@@ -15,15 +16,22 @@ const TOO_LARGE: &str = "this file is too large to be a grains world";
 const TOO_MANY: &str = "this world file has too many cells";
 const LINK_TOO_BIG: &str = "this world is too big for a link";
 
-pub fn encode(words: &[u32]) -> Result<Vec<u8>, String> {
-    if words.len() != CELL_COUNT {
+#[derive(Debug)]
+pub struct Saved {
+    pub width: u32,
+    pub height: u32,
+    pub words: Vec<u32>,
+}
+
+pub fn encode(words: &[u32], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 || words.len() != width as usize * height as usize {
         return Err("the grid is the wrong size to save".to_string());
     }
     let mut out = Vec::with_capacity(HEADER + 8);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&(GRID_WIDTH as u16).to_le_bytes());
-    out.extend_from_slice(&(GRID_HEIGHT as u16).to_le_bytes());
+    out.extend_from_slice(&(width as u16).to_le_bytes());
+    out.extend_from_slice(&(height as u16).to_le_bytes());
     let mut index = 0;
     while index < words.len() {
         let value = words[index];
@@ -38,7 +46,7 @@ pub fn encode(words: &[u32]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-pub fn decode(bytes: &[u8]) -> Result<Vec<u32>, String> {
+pub fn decode(bytes: &[u8]) -> Result<Saved, String> {
     if bytes.len() > MAX_FILE {
         return Err(TOO_LARGE.to_string());
     }
@@ -60,23 +68,21 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u32>, String> {
     let width = u16::from_le_bytes([bytes[6], bytes[7]]);
     let height = u16::from_le_bytes([bytes[8], bytes[9]]);
     let count = u64::from(width) * u64::from(height);
-    if u32::from(width) > GRID_WIDTH as u32
-        || u32::from(height) > GRID_HEIGHT as u32
-        || count > CELL_COUNT as u64
+    if width == 0
+        || height == 0
+        || u32::from(width) > MAX_EDGE
+        || u32::from(height) > MAX_EDGE
+        || count > MAX_CELLS as u64
     {
         return Err(format!(
             "this world is {width} by {height}, which is larger than grains can load"
         ));
     }
-    if width != GRID_WIDTH as u16 || height != GRID_HEIGHT as u16 {
-        return Err(format!(
-            "this world is {width} by {height}, and grains is {GRID_WIDTH} by {GRID_HEIGHT}"
-        ));
-    }
-    let mut words = vec![0u32; CELL_COUNT];
+    let count = count as usize;
+    let mut words = vec![0u32; count];
     let mut filled = 0usize;
     let mut cursor = HEADER;
-    while filled < CELL_COUNT {
+    while filled < count {
         if cursor + 8 > bytes.len() {
             return Err(CUT_OFF.to_string());
         }
@@ -97,7 +103,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u32>, String> {
             return Err(DAMAGED.to_string());
         }
         let run = run as usize;
-        if filled + run > CELL_COUNT {
+        if filled + run > count {
             return Err(TOO_MANY.to_string());
         }
         words[filled..filled + run].fill(value);
@@ -106,7 +112,11 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u32>, String> {
     if cursor != bytes.len() {
         return Err(DAMAGED.to_string());
     }
-    Ok(words)
+    Ok(Saved {
+        width: u32::from(width),
+        height: u32::from(height),
+        words,
+    })
 }
 
 pub fn hash_fragment(file: &[u8]) -> Result<String, String> {
@@ -197,8 +207,8 @@ fn base64url_decode(text: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CUT_OFF, DAMAGED, LINK_TOO_BIG, NOT_WORLD, TOO_LARGE, bytes_from_hash, decode, encode,
-        hash_fragment,
+        CUT_OFF, DAMAGED, LINK_TOO_BIG, NOT_WORLD, TOO_LARGE, TOO_MANY, bytes_from_hash, decode,
+        encode, hash_fragment,
     };
     use crate::grid::{CELL_COUNT, Cell, SAND, STONE};
 
@@ -207,26 +217,30 @@ mod tests {
         let mut words = vec![0u32; CELL_COUNT];
         words[0] = Cell::pack(SAND, 0xab, 0x11, 0x04).to_bits();
         words[1] = Cell::pack(STONE, 0x03, 0, 0).to_bits();
-        let file = encode(&words).expect("encode");
+        let file = encode(&words, 512, 288).expect("encode");
         assert_eq!(&file[..4], b"GRNS");
         assert_eq!(u16::from_le_bytes([file[4], file[5]]), 1);
         assert_eq!(u16::from_le_bytes([file[6], file[7]]), 512);
         assert_eq!(u16::from_le_bytes([file[8], file[9]]), 288);
         assert!(file.len() < words.len() * 4, "the file was not compact");
         let loaded = decode(&file).expect("decode");
-        assert_eq!(loaded[0], words[0]);
-        assert_eq!(loaded[1], words[1]);
-        assert_eq!(loaded[2], 0);
+        assert_eq!((loaded.width, loaded.height), (512, 288));
+        assert_eq!(loaded.words[0], words[0]);
+        assert_eq!(loaded.words[1], words[1]);
+        assert_eq!(loaded.words[2], 0);
         let link = hash_fragment(&file).expect("link");
         let from_link =
             decode(&bytes_from_hash(&format!("#{link}")).expect("hash")).expect("world");
-        assert_eq!(from_link[0], words[0]);
+        assert_eq!(from_link.words[0], words[0]);
+        let big = vec![7u32; 128 * 64];
+        let wide = decode(&encode(&big, 128, 64).expect("wide")).expect("wide decode");
+        assert_eq!((wide.width, wide.height, wide.words[0]), (128, 64, 7));
     }
 
     #[test]
     fn corrupt_and_truncated_files_are_rejected() {
         let words = vec![0u32; CELL_COUNT];
-        let file = encode(&words).expect("encode");
+        let file = encode(&words, 512, 288).expect("encode");
         assert_eq!(decode(b"nope").unwrap_err(), NOT_WORLD);
         assert_eq!(decode(b"GR").unwrap_err(), CUT_OFF);
         assert_eq!(decode(&file[..file.len() - 1]).unwrap_err(), CUT_OFF);
@@ -250,10 +264,7 @@ mod tests {
         small[7] = 0;
         small[8] = 1;
         small[9] = 0;
-        assert_eq!(
-            decode(&small).unwrap_err(),
-            "this world is 1 by 1, and grains is 512 by 288"
-        );
+        assert_eq!(decode(&small).unwrap_err(), TOO_MANY);
         let mut zero_run = file.clone();
         let len = zero_run.len();
         zero_run[len - 4..].fill(0);
@@ -261,11 +272,11 @@ mod tests {
         let mut extra = file.clone();
         extra.push(0);
         assert_eq!(decode(&extra).unwrap_err(), DAMAGED);
-        let mut huge = file.clone();
-        huge.resize(file.len() + CELL_COUNT * 8, 0);
+        let mut huge = vec![0u8; super::MAX_FILE + 1];
+        huge[..4].copy_from_slice(b"GRNS");
         assert_eq!(decode(&huge).unwrap_err(), TOO_LARGE);
         let dense: Vec<u32> = (0..CELL_COUNT as u32).collect();
-        let dense_file = encode(&dense).expect("dense");
+        let dense_file = encode(&dense, 512, 288).expect("dense");
         assert_eq!(hash_fragment(&dense_file).unwrap_err(), LINK_TOO_BIG);
     }
 }

@@ -85,12 +85,19 @@ fn key_for(id: u8) -> Option<char> {
         .map(|(key, _)| *key)
 }
 
-pub fn show(ctx: &egui::Context, controls: &mut Controls, fps: f32, notice: &str) {
+pub fn show(
+    ctx: &egui::Context,
+    controls: &mut Controls,
+    fps: f32,
+    notice: &str,
+    awake: u32,
+    chunks: u32,
+) {
     egui::Window::new("grains")
         .default_pos([12.0, 12.0])
         .resizable(false)
         .show(ctx, |ui| {
-            panel(ui, controls, fps, notice);
+            panel(ui, controls, fps, notice, awake, chunks);
         });
 }
 
@@ -100,12 +107,20 @@ struct LaidOut {
     save: egui::Rect,
 }
 
-fn panel(ui: &mut egui::Ui, controls: &mut Controls, fps: f32, notice: &str) -> LaidOut {
+fn panel(
+    ui: &mut egui::Ui,
+    controls: &mut Controls,
+    fps: f32,
+    notice: &str,
+    awake: u32,
+    chunks: u32,
+) -> LaidOut {
     if fps > 0.0 {
         ui.label(format!("{fps:.0} fps"));
     } else {
         ui.label("fps");
     }
+    ui.label(format!("{awake} / {chunks} chunks"));
     let mut rects = Vec::new();
     for row in palette() {
         let rect = swatch(ui, controls, &row);
@@ -200,7 +215,7 @@ mod tests {
         let mut wood = None;
         let output = ctx.run_pass(input(screen, &[]), |ctx| {
             ctx.root_ui(|ui| {
-                for (id, rect) in panel(ui, &mut controls, 60.0, "").swatches {
+                for (id, rect) in panel(ui, &mut controls, 60.0, "", 0, 1).swatches {
                     if id == WOOD {
                         wood = Some(rect);
                     }
@@ -223,7 +238,7 @@ mod tests {
         let mut save = None;
         let output = ctx.run_pass(input(screen, &[]), |ctx| {
             ctx.root_ui(|ui| {
-                save = Some(panel(ui, &mut controls, 60.0, "").save);
+                save = Some(panel(ui, &mut controls, 60.0, "", 0, 1).save);
             });
         });
         output.drop_without_applying_deltas();
@@ -252,7 +267,7 @@ mod tests {
         ];
         let output = ctx.run_pass(input(screen, &events), |ctx| {
             ctx.root_ui(|ui| {
-                panel(ui, controls, 60.0, "");
+                panel(ui, controls, 60.0, "", 0, 1);
             });
         });
         output.drop_without_applying_deltas();

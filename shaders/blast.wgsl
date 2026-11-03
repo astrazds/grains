@@ -1,5 +1,3 @@
-const WIDTH: u32 = 512u;
-const HEIGHT: u32 = 288u;
 const EMPTY: u32 = 0u;
 const SAND: u32 = 1u;
 const STONE: u32 = 2u;
@@ -9,6 +7,18 @@ const FIRE: u32 = 7u;
 const TNT: u32 = 9u;
 const RADIUS: i32 = 4;
 const NONE: u32 = 0xffffffffu;
+const CHUNK: u32 = 64u;
+
+struct World {
+    offset: u32,
+    width: u32,
+    height: u32,
+    awake: u32,
+    chunk_cols: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
 
 struct Particle {
     x: f32,
@@ -25,17 +35,19 @@ struct Particle {
 @group(0) @binding(1) var<storage, read_write> settled: array<u32>;
 @group(0) @binding(2) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(3) var<storage, read_write> claims: array<atomic<u32>>;
+@group(0) @binding(4) var<uniform> world: World;
+@group(0) @binding(5) var<storage, read_write> chunks: array<u32>;
 
 fn material_of(word: u32) -> u32 {
     return word & 0xffu;
 }
 
 fn index_at(x: i32, y: i32) -> u32 {
-    return u32(y) * WIDTH + u32(x);
+    return u32(y) * world.width + u32(x);
 }
 
 fn inside(x: i32, y: i32) -> bool {
-    return x >= 0 && y >= 0 && u32(x) < WIDTH && u32(y) < HEIGHT;
+    return x >= 0 && y >= 0 && u32(x) < world.width && u32(y) < world.height;
 }
 
 fn loose(word: u32) -> bool {
@@ -75,15 +87,44 @@ fn detonator(x: i32, y: i32) -> bool {
 }
 
 fn cell_of(id: vec2<u32>) -> u32 {
-    return id.y * WIDTH + id.x;
+    return id.y * world.width + id.x;
+}
+
+
+fn chunk_xy(id: vec3<u32>) -> vec2<u32> {
+    let packed = chunks[id.z];
+    return vec2<u32>((packed & 0xffffu) * CHUNK + id.x, (packed >> 16u) * CHUNK + id.y);
+}
+
+fn locate(id: vec3<u32>, x: ptr<function, u32>, y: ptr<function, u32>) -> bool {
+    if (world.awake == 0xffffffffu) {
+        if (id.x >= world.width || id.y >= world.height) {
+            return false;
+        }
+        *x = id.x;
+        *y = id.y;
+        return true;
+    }
+    if (id.z >= world.awake || id.x >= CHUNK || id.y >= CHUNK) {
+        return false;
+    }
+    let cell = chunk_xy(id);
+    if (cell.x >= world.width || cell.y >= world.height) {
+        return false;
+    }
+    *x = cell.x;
+    *y = cell.y;
+    return true;
 }
 
 @compute @workgroup_size(8, 8)
 fn blast(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    var x: u32;
+    var y: u32;
+    if (!locate(id, &x, &y)) {
         return;
     }
-    let here = cell_of(id.xy);
+    let here = y * world.width + x;
     let word = settled[here];
     var nearest = 999;
     var center_x = 0;
@@ -95,14 +136,14 @@ fn blast(@builtin(global_invocation_id) id: vec3<u32>) {
             if (dist2 > RADIUS * RADIUS) {
                 continue;
             }
-            let x = i32(id.x) + dx;
-            let y = i32(id.y) + dy;
-            if (!detonator(x, y) || dist2 >= nearest) {
+            let sx = i32(x) + dx;
+            let sy = i32(y) + dy;
+            if (!detonator(sx, sy) || dist2 >= nearest) {
                 continue;
             }
             nearest = dist2;
-            center_x = x;
-            center_y = y;
+            center_x = sx;
+            center_y = sy;
             found = true;
         }
     }
@@ -115,14 +156,14 @@ fn blast(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     if (loose(word) && particles[here].word == 0u) {
-        let dx = f32(i32(id.x) - center_x);
-        let dy = f32(i32(id.y) - center_y);
-        let span = max(sqrt(dx * dx + dy * dy), 1.0);
+        let throw_x = f32(i32(x) - center_x);
+        let throw_y = f32(i32(y) - center_y);
+        let span = max(sqrt(throw_x * throw_x + throw_y * throw_y), 1.0);
         var thrown: Particle;
-        thrown.x = f32(id.x) + 0.5;
-        thrown.y = f32(id.y) + 0.5;
-        thrown.vx = dx / span * 1.8;
-        thrown.vy = dy / span * 1.8 - 1.4;
+        thrown.x = f32(x) + 0.5;
+        thrown.y = f32(y) + 0.5;
+        thrown.vx = throw_x / span * 1.8;
+        thrown.vy = throw_y / span * 1.8 - 1.4;
         thrown.word = word;
         thrown.age = 0u;
         thrown._pad0 = 0u;
@@ -144,10 +185,12 @@ fn blast(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn fly(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    var x: u32;
+    var y: u32;
+    if (!locate(id, &x, &y)) {
         return;
     }
-    let here = cell_of(id.xy);
+    let here = y * world.width + x;
     var speck = particles[here];
     if (speck.word == 0u) {
         return;
@@ -166,25 +209,29 @@ fn fly(@builtin(global_invocation_id) id: vec3<u32>) {
         speck.y = 0.5;
         speck.vy = 0.0;
     }
-    speck.x = clamp(speck.x, 0.5, f32(WIDTH) - 1.5);
-    speck.y = clamp(speck.y, 0.5, f32(HEIGHT) - 1.5);
+    speck.x = clamp(speck.x, 0.5, f32(world.width) - 1.5);
+    speck.y = clamp(speck.y, 0.5, f32(world.height) - 1.5);
     particles[here] = speck;
 }
 
 @compute @workgroup_size(8, 8)
 fn clear_claims(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    var x: u32;
+    var y: u32;
+    if (!locate(id, &x, &y)) {
         return;
     }
-    atomicStore(&claims[cell_of(id.xy)], NONE);
+    atomicStore(&claims[y * world.width + x], NONE);
 }
 
 @compute @workgroup_size(8, 8)
 fn claim(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    var cell_x: u32;
+    var cell_y: u32;
+    if (!locate(id, &cell_x, &cell_y)) {
         return;
     }
-    let here = cell_of(id.xy);
+    let here = cell_y * world.width + cell_x;
     let speck = particles[here];
     if (speck.word == 0u || speck.age < 8u) {
         return;
@@ -199,10 +246,12 @@ fn claim(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn land(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    var x: u32;
+    var y: u32;
+    if (!locate(id, &x, &y)) {
         return;
     }
-    let here = cell_of(id.xy);
+    let here = y * world.width + x;
     let slot = atomicLoad(&claims[here]);
     if (slot == NONE || material_of(settled[here]) != EMPTY) {
         return;
@@ -219,10 +268,12 @@ fn land(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn nudge(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    var cell_x: u32;
+    var cell_y: u32;
+    if (!locate(id, &cell_x, &cell_y)) {
         return;
     }
-    let here = cell_of(id.xy);
+    let here = cell_y * world.width + cell_x;
     var speck = particles[here];
     if (speck.word == 0u || speck.age < 8u) {
         return;
@@ -237,7 +288,7 @@ fn nudge(@builtin(global_invocation_id) id: vec3<u32>) {
     if (won && !blocked) {
         return;
     }
-    speck.x = clamp(speck.x + 1.25, 0.5, f32(WIDTH) - 1.5);
-    speck.y = clamp(speck.y + 0.4, 0.5, f32(HEIGHT) - 1.5);
+    speck.x = clamp(speck.x + 1.25, 0.5, f32(world.width) - 1.5);
+    speck.y = clamp(speck.y + 0.4, 0.5, f32(world.height) - 1.5);
     particles[here] = speck;
 }
