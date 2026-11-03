@@ -35,6 +35,9 @@ pub(crate) struct Gpu {
     sim_uniform: wgpu::Buffer,
     sim_groups: [wgpu::BindGroup; 2],
     sim_pipeline: wgpu::ComputePipeline,
+    brush_uniform: wgpu::Buffer,
+    brush_groups: [wgpu::BindGroup; 2],
+    brush_pipeline: wgpu::ComputePipeline,
 }
 
 struct Surface {
@@ -67,6 +70,27 @@ struct SimUniform {
 }
 
 const _: () = assert!(std::mem::size_of::<SimUniform>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct Stroke {
+    pub from_x: i32,
+    pub from_y: i32,
+    pub to_x: i32,
+    pub to_y: i32,
+    pub radius: u32,
+    pub material: u32,
+    pub erase: u32,
+    pub clear: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Stroke>() == 32);
+
+pub(crate) struct Paint {
+    pub paused: bool,
+    pub clear: bool,
+    pub stroke: Option<Stroke>,
+}
 
 pub(crate) fn wait(future: impl Future<Output = ()> + 'static) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -120,7 +144,7 @@ impl Gpu {
         self.reconfigure();
     }
 
-    pub(crate) fn draw(&mut self, window: &Window, grid: &Grid) {
+    pub(crate) fn draw(&mut self, window: &Window, grid: &Grid, paint: Paint) {
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
@@ -132,7 +156,7 @@ impl Gpu {
         };
         match current {
             wgpu::CurrentSurfaceTexture::Success(frame) => {
-                self.paint(&frame.texture, grid);
+                self.paint(&frame.texture, grid, &paint);
                 window.pre_present_notify();
                 self.queue.present(frame);
             }
@@ -232,6 +256,9 @@ impl Gpu {
             sim_uniform: gpu_parts.sim_uniform,
             sim_groups: gpu_parts.sim_groups,
             sim_pipeline: gpu_parts.sim_pipeline,
+            brush_uniform: gpu_parts.brush_uniform,
+            brush_groups: gpu_parts.brush_groups,
+            brush_pipeline: gpu_parts.brush_pipeline,
         })
     }
 
@@ -258,11 +285,35 @@ impl Gpu {
         self.reconfigure();
     }
 
-    fn paint(&mut self, texture: &wgpu::Texture, grid: &Grid) {
+    fn paint(&mut self, texture: &wgpu::Texture, grid: &Grid, input: &Paint) {
         if !self.seeded {
             self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
             self.front = 0;
             self.seeded = true;
+        }
+        if input.clear {
+            self.apply_brush(Stroke {
+                from_x: 0,
+                from_y: 0,
+                to_x: 0,
+                to_y: 0,
+                radius: 0,
+                material: 0,
+                erase: 0,
+                clear: 1,
+            });
+        }
+        if let Some(stroke) = input.stroke {
+            self.apply_brush(stroke);
+        }
+        if input.paused {
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            self.draw_cells(&mut encoder, &view, self.size, self.front);
+            self.queue.submit([encoder.finish()]);
+            return;
         }
         for _ in 0..PASSES_PER_FRAME {
             let offset = self.passes % 2;
@@ -380,6 +431,25 @@ impl Gpu {
         self.front = dst;
     }
 
+    fn apply_brush(&mut self, stroke: Stroke) {
+        self.queue
+            .write_buffer(&self.brush_uniform, 0, bytemuck::bytes_of(&stroke));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.brush_pipeline);
+            pass.set_bind_group(0, &self.brush_groups[self.front], &[]);
+            let (groups_x, groups_y) = cell_groups();
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
     #[cfg(test)]
     pub(crate) fn preview(grid: &Grid, passes: u32, size: Size) -> Result<Vec<u8>, NoAdapter> {
         let mut gpu = pollster::block_on(Self::open(None, size))?;
@@ -449,6 +519,21 @@ impl Gpu {
             pixels.extend_from_slice(&mapped[start..start + row]);
         }
         pixels
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stamp(grid: &Grid, stroke: Stroke) -> Result<Vec<crate::grid::Cell>, NoAdapter> {
+        let mut gpu = pollster::block_on(Self::open(
+            None,
+            Size {
+                width: GRID_WIDTH as u32,
+                height: GRID_HEIGHT as u32,
+            },
+        ))?;
+        gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
+        gpu.front = 0;
+        gpu.apply_brush(stroke);
+        Ok(gpu.read_cells(0))
     }
 
     #[cfg(test)]
@@ -542,6 +627,9 @@ struct Parts {
     sim_uniform: wgpu::Buffer,
     sim_groups: [wgpu::BindGroup; 2],
     sim_pipeline: wgpu::ComputePipeline,
+    brush_uniform: wgpu::Buffer,
+    brush_groups: [wgpu::BindGroup; 2],
+    brush_pipeline: wgpu::ComputePipeline,
 }
 
 fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
@@ -738,6 +826,78 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         compilation_options: Default::default(),
         cache: None,
     });
+    let brush_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 32,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let brush_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let brush_groups = [0, 1].map(|index| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &brush_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &cells[index],
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &brush_uniform,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        })
+    });
+    let brush_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/brush.wgsl").into()),
+    });
+    let brush_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&brush_layout)],
+        immediate_size: 0,
+    });
+    let brush_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&brush_pipeline_layout),
+        module: &brush_shader,
+        entry_point: Some("paint"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
     Parts {
         cells,
         uniform,
@@ -746,7 +906,17 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         sim_uniform,
         sim_groups,
         sim_pipeline,
+        brush_uniform,
+        brush_groups,
+        brush_pipeline,
     }
+}
+
+fn cell_groups() -> (u32, u32) {
+    (
+        (GRID_WIDTH as u32).div_ceil(8),
+        (GRID_HEIGHT as u32).div_ceil(8),
+    )
 }
 
 fn workgroups(offset: u32) -> (u32, u32) {
@@ -946,6 +1116,98 @@ mod tests {
             }
             std::fs::write(path, ppm).unwrap();
         }
+    }
+
+    #[test]
+    fn stroke_fills_the_cells_between_the_ends() {
+        use crate::grid::{EMPTY, SAND};
+        let grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        let Some(cells) = colours(super::Gpu::stamp(
+            &grid,
+            super::Stroke {
+                from_x: 2,
+                from_y: 10,
+                to_x: 20,
+                to_y: 10,
+                radius: 0,
+                material: u32::from(SAND),
+                erase: 0,
+                clear: 0,
+            },
+        )) else {
+            return;
+        };
+        for x in 2..=20 {
+            assert_eq!(material_at(&cells, x, 10), SAND, "gap at {x}");
+            assert_eq!(material_at(&cells, x, 9), EMPTY);
+            assert_eq!(material_at(&cells, x, 11), EMPTY);
+        }
+        let Some(diagonal) = colours(super::Gpu::stamp(
+            &grid,
+            super::Stroke {
+                from_x: 0,
+                from_y: 30,
+                to_x: 10,
+                to_y: 40,
+                radius: 0,
+                material: u32::from(SAND),
+                erase: 0,
+                clear: 0,
+            },
+        )) else {
+            return;
+        };
+        for i in 0..=10 {
+            assert_eq!(material_at(&diagonal, i, 30 + i), SAND, "gap at {i}");
+        }
+        eprintln!("asserted continuous strokes (2,10)-(20,10) and (0,30)-(10,40)");
+    }
+
+    #[test]
+    fn erase_clears_and_paint_leaves_stone() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(10, 10, Cell::pack(STONE, 0, 0, 0));
+        let Some(painted) = colours(super::Gpu::stamp(
+            &grid,
+            super::Stroke {
+                from_x: 2,
+                from_y: 10,
+                to_x: 20,
+                to_y: 10,
+                radius: 0,
+                material: u32::from(SAND),
+                erase: 0,
+                clear: 0,
+            },
+        )) else {
+            return;
+        };
+        assert_eq!(material_at(&painted, 10, 10), STONE);
+        assert_eq!(material_at(&painted, 9, 10), SAND);
+        assert_eq!(material_at(&painted, 11, 10), SAND);
+        let held = crate::grid::Grid::from_fn(|x, y| painted[y * crate::grid::GRID_WIDTH + x]);
+        let Some(erased) = colours(super::Gpu::stamp(
+            &held,
+            super::Stroke {
+                from_x: 8,
+                from_y: 10,
+                to_x: 12,
+                to_y: 10,
+                radius: 0,
+                material: 0,
+                erase: 1,
+                clear: 0,
+            },
+        )) else {
+            return;
+        };
+        assert_eq!(material_at(&erased, 10, 10), EMPTY);
+        assert_eq!(material_at(&erased, 9, 10), EMPTY);
+        assert_eq!(material_at(&erased, 11, 10), EMPTY);
+        assert_eq!(material_at(&erased, 2, 10), SAND);
+        assert_eq!(material_at(&erased, 20, 10), SAND);
+        eprintln!("asserted stone survived paint and erase cleared (8,10)-(12,10)");
     }
 
     #[test]
