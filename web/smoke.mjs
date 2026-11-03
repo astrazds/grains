@@ -78,6 +78,12 @@ try {
   await page.goto(`http://127.0.0.1:${port}/?probe=1`, {
     waitUntil: "domcontentloaded",
   });
+  // winit makes the canvas focusable when it installs its input handlers.
+  // Pause before waiting for readback so the brush probe is deterministic
+  // even when software WebGPU takes several seconds to render a frame.
+  await page.locator("#grains[tabindex]").focus();
+  await page.keyboard.press("Space");
+  await page.keyboard.press("2");
   await page.waitForFunction(
     () => {
       const pixels = window.grainsPixels;
@@ -89,9 +95,6 @@ try {
     null,
     { timeout: 120000 },
   );
-  await page.locator("#grains").focus();
-  await page.keyboard.press("Space");
-  await page.keyboard.press("2"); // Stone stays where the stroke was sampled.
   const before = await page.evaluate(() => window.grainsPixels.stroke.slice());
   await page.mouse.move(700, 300);
   await page.mouse.down();

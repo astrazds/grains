@@ -254,6 +254,15 @@ impl Gpu {
         self.paint(&frame.texture, grid, &paint, ui);
         window.pre_present_notify();
         self.queue.present(frame);
+        // On WebGPU, presenting does not wait for the submitted simulation.
+        // Pace redraws to the queue so software adapters cannot fall behind.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(window) = self.window.clone() {
+            self.queue
+                .on_submitted_work_done(move || window.request_redraw());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        window.request_redraw();
     }
 
     async fn open(

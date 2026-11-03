@@ -505,7 +505,6 @@ impl App {
                 ui,
             );
         }
-        window.request_redraw();
     }
 
     fn run_panel(&mut self, window: &Window) -> Option<EguiFrame> {
