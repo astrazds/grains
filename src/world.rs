@@ -7,12 +7,12 @@ pub const LINK_LIMIT: usize = 16_384;
 const MAGIC: &[u8; 4] = b"GRNS";
 const VERSION: u16 = 1;
 const HEADER: usize = 10;
-const MAX_FILE: usize = HEADER + MAX_CELLS * 8;
+pub const MAX_FILE: usize = HEADER + MAX_CELLS * 8;
 
 const NOT_WORLD: &str = "this is not a grains world";
 const CUT_OFF: &str = "this world file is cut off";
 const DAMAGED: &str = "this world file is damaged";
-const TOO_LARGE: &str = "this file is too large to be a grains world";
+pub const TOO_LARGE: &str = "this file is too large to be a grains world";
 const TOO_MANY: &str = "this world file has too many cells";
 const LINK_TOO_BIG: &str = "this world is too big for a link";
 
@@ -23,8 +23,36 @@ pub struct Saved {
     pub words: Vec<u32>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn replace_file(directory: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut pending = tempfile::NamedTempFile::new_in(directory)?;
+    pending.write_all(bytes)?;
+    pending.as_file().sync_all()?;
+    pending.persist(directory.join(FILE_NAME))?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_file() -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let file = std::fs::File::open(FILE_NAME)?;
+    if file.metadata()?.len() > MAX_FILE as u64 {
+        return Err(Error::new(ErrorKind::InvalidData, TOO_LARGE));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE as u64 + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 pub fn encode(words: &[u32], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    if width == 0 || height == 0 || words.len() != width as usize * height as usize {
+    if width == 0
+        || height == 0
+        || width > MAX_EDGE
+        || height > MAX_EDGE
+        || words.len() > MAX_CELLS
+        || words.len() != width as usize * height as usize
+    {
         return Err("the grid is the wrong size to save".to_string());
     }
     let mut out = Vec::with_capacity(HEADER + 8);
@@ -103,7 +131,7 @@ pub fn decode(bytes: &[u8]) -> Result<Saved, String> {
             return Err(DAMAGED.to_string());
         }
         let run = run as usize;
-        if filled + run > count {
+        if run > count - filled {
             return Err(TOO_MANY.to_string());
         }
         words[filled..filled + run].fill(value);
@@ -126,11 +154,49 @@ pub fn hash_fragment(file: &[u8]) -> Result<String, String> {
     Ok(base64url(file))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn desktop_fragment(words: &[u32]) -> Result<String, String> {
+    let (width, height) = crate::grid::world_size();
+    let (web_w, web_h) = crate::grid::WEB_WORLD;
+    if words.len() != width * height {
+        return Err("the grid is the wrong size to save".to_string());
+    }
+    // Centre the browser-sized crop around all occupied cells. Never drop a word.
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for (y, row) in words.chunks_exact(width).enumerate() {
+        if let Some(x) = row.iter().position(|&word| word != 0) {
+            left = left.min(x);
+            right = right.max(row.iter().rposition(|&word| word != 0).unwrap() + 1);
+            top = top.min(y);
+            bottom = y + 1;
+        }
+    }
+    if right.saturating_sub(left) > web_w || bottom.saturating_sub(top) > web_h {
+        return Err("the world is too wide or tall for a browser link".to_string());
+    }
+    let x = (left + right)
+        .saturating_sub(web_w)
+        .div_euclid(2)
+        .min(width - web_w);
+    let y = (top + bottom)
+        .saturating_sub(web_h)
+        .div_euclid(2)
+        .min(height - web_h);
+    let mut crop = Vec::with_capacity(web_w * web_h);
+    for row in words.chunks_exact(width).skip(y).take(web_h) {
+        crop.extend_from_slice(&row[x..x + web_w]);
+    }
+    hash_fragment(&encode(&crop, web_w as u32, web_h as u32)?)
+}
+
 #[cfg(any(test, target_arch = "wasm32"))]
 pub fn bytes_from_hash(hash: &str) -> Result<Vec<u8>, String> {
     let text = hash.trim().trim_start_matches('#');
     if text.is_empty() {
         return Err("this link has no world".to_string());
+    }
+    if text.len() > (LINK_LIMIT * 4).div_ceil(3) {
+        return Err(LINK_TOO_BIG.to_string());
     }
     base64url_decode(text)
 }
@@ -211,6 +277,70 @@ mod tests {
         encode, hash_fragment,
     };
     use crate::grid::{CELL_COUNT, Cell, SAND, STONE};
+
+    #[test]
+    fn loading_during_a_save_reads_one_complete_world() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let first = encode(&[0], 1, 1).unwrap();
+        let second = encode(&[2, 3], 2, 1).unwrap();
+        super::replace_file(dir.path(), &first).unwrap();
+        let path = dir.path().join(super::FILE_NAME);
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let replace = super::replace_file(dir.path(), &second);
+        let mut prior = Vec::new();
+        reader.read_to_end(&mut prior).unwrap();
+        assert_eq!(prior, first);
+        drop(reader);
+        if let Err(error) = replace {
+            // Windows can refuse to replace an open file. The original must
+            // still be intact, and saving again after the reader closes works.
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::read(&path).unwrap(), first);
+            super::replace_file(dir.path(), &second).unwrap();
+        }
+        assert_eq!(std::fs::read(path).unwrap(), second);
+    }
+
+    #[test]
+    fn oversized_hashes_are_rejected_on_input() {
+        let bytes = vec![0; super::LINK_LIMIT + 1];
+        assert_eq!(
+            bytes_from_hash(&super::base64url(&bytes)).unwrap_err(),
+            LINK_TOO_BIG
+        );
+    }
+
+    #[test]
+    fn encoder_refuses_unreadable_dimensions() {
+        assert!(encode(&vec![0; 65537], 65537, 1).is_err());
+    }
+
+    #[test]
+    fn loading_a_legacy_world_brings_its_cells_into_view() {
+        let mut app = crate::App::new();
+        let mut words = vec![0; 512 * 288];
+        words[256 + 144 * 512] = 0xab01;
+        app.apply_file(&encode(&words, 512, 288).unwrap());
+        assert_eq!(app.grid.cell(256, 144).to_bits(), 0xab01);
+        let x = (256.0 - app.camera.cell_x) * app.camera.zoom;
+        let y = (144.0 - app.camera.cell_y) * app.camera.zoom;
+        assert!((0.0..1024.0).contains(&x) && (0.0..600.0).contains(&y));
+        app.apply_file(b"nope");
+        assert_eq!(app.grid.cell(256, 144).to_bits(), 0xab01);
+    }
+
+    #[test]
+    fn a_desktop_link_fits_the_browser_world() {
+        let mut words = vec![0; 2048 * 1152];
+        words[800 * 2048 + 1600] = 0xab01;
+        let fragment = super::desktop_fragment(&words).unwrap();
+        let saved = decode(&bytes_from_hash(&fragment).unwrap()).unwrap();
+        assert!(saved.width <= 1024 && saved.height <= 576);
+        assert_eq!(saved.words[288 * 1024 + 576], 0xab01);
+        words[0] = 2;
+        assert!(super::desktop_fragment(&words).is_err());
+    }
 
     #[test]
     fn a_world_keeps_its_colour_bytes() {

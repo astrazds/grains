@@ -130,44 +130,28 @@ pub fn pick_file(slot: crate::Inbox) {
         let Some(file) = files.get(0) else {
             return;
         };
-        let Ok(reader) = web_sys::FileReader::new() else {
-            *slot.borrow_mut() = Some(Err("could not read the file".to_string()));
+        if file.size() > crate::world::MAX_FILE as f64 {
+            *slot.borrow_mut() = Some(Err(crate::world::TOO_LARGE.to_string()));
             return;
-        };
-        let reading = reader.clone();
-        let loaded = Rc::clone(&slot);
-        let done = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-            *loaded.borrow_mut() = Some(file_bytes(&reading));
-        }) as Box<dyn FnMut(web_sys::Event)>);
-        reader.set_onload(Some(done.as_ref().unchecked_ref()));
-        ONLOAD.with(|onload| *onload.borrow_mut() = Some(done));
-        if reader.read_as_array_buffer(&file).is_err() {
-            *slot.borrow_mut() = Some(Err("could not read the file".to_string()));
         }
+        let loaded = Rc::clone(&slot);
+        wasm_bindgen_futures::spawn_local(async move {
+            let bytes = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+                .await
+                .map(|value| js_sys::Uint8Array::new(&value).to_vec())
+                .map_err(|_| "could not read the file".to_string());
+            *loaded.borrow_mut() = Some(bytes);
+        });
     }) as Box<dyn FnMut(web_sys::Event)>);
     input.set_onchange(Some(change.as_ref().unchecked_ref()));
     ONCHANGE.with(|onchange| *onchange.borrow_mut() = Some(change));
-    if let Some(body) = document.body() {
-        let _ = body.append_child(&input);
-    }
     input.click();
-}
-
-fn file_bytes(reader: &web_sys::FileReader) -> Result<Vec<u8>, String> {
-    let value = reader
-        .result()
-        .map_err(|_| "could not read the file".to_string())?;
-    let buffer = value
-        .dyn_into::<js_sys::ArrayBuffer>()
-        .map_err(|_| "could not read the file".to_string())?;
-    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
 type Listener = RefCell<Option<Closure<dyn FnMut(web_sys::Event)>>>;
 
 thread_local! {
     static ONCHANGE: Listener = const { RefCell::new(None) };
-    static ONLOAD: Listener = const { RefCell::new(None) };
 }
 
 fn device_pixels(css_px: i32, ratio: f64) -> u32 {

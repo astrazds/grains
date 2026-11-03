@@ -50,8 +50,8 @@ struct App {
     inbox: Inbox,
     link_checked: bool,
     camera: Camera,
-    panning: bool,
-    pan_last: Option<(f64, f64)>,
+    pan_button: Option<MouseButton>,
+    pending_strokes: Vec<Stroke>,
     modifiers: Modifiers,
 }
 
@@ -60,30 +60,7 @@ pub fn run() {
     eprintln!("passes 4");
     eprintln!("bloom on");
     let event_loop = EventLoop::new().expect("event loop");
-    let app = App {
-        window: None,
-        gpu: Rc::new(std::cell::RefCell::new(None)),
-        grid: Grid::demo_world(),
-        controls: Controls::new(),
-        over_panel: false,
-        fps: 0.0,
-        last_frame: web_time::Instant::now(),
-        egui: None,
-        painting: false,
-        erasing: false,
-        cursor: None,
-        last_cell: None,
-        notice: Rc::new(RefCell::new(String::new())),
-        inbox: Rc::new(RefCell::new(None)),
-        link_checked: false,
-        camera: {
-            let (width, height) = grid::world_size();
-            Camera::centered(width as u32, height as u32, 1024, 600)
-        },
-        panning: false,
-        pan_last: None,
-        modifiers: Modifiers::default(),
-    };
+    let app = App::new();
     #[cfg(not(target_arch = "wasm32"))]
     {
         let mut app = app;
@@ -158,6 +135,13 @@ impl ApplicationHandler for App {
                 .create_window(window_attributes())
                 .expect("window"),
         );
+        let size = frame_size(&window, window.inner_size());
+        self.camera = Camera::centered(
+            self.grid.width() as u32,
+            self.grid.height() as u32,
+            size.width,
+            size.height,
+        );
         let slot = Rc::clone(&self.gpu);
         let painted = Arc::clone(&window);
         gpu::wait(async move {
@@ -198,62 +182,76 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
-                    gpu.resize(frame_size(&window, size));
-                }
+                self.resize(frame_size(&window, size));
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
-                    gpu.resize(frame_size(&window, window.inner_size()));
-                }
+                self.resize(frame_size(&window, window.inner_size()));
             }
             WindowEvent::RedrawRequested => self.redraw(&window),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             WindowEvent::CursorMoved { position, .. } => {
-                if self.panning {
-                    if let Some((last_x, last_y)) = self.pan_last {
-                        let (width, height) = grid::world_size();
-                        self.camera.pan(
-                            (position.x - last_x) as f32,
-                            (position.y - last_y) as f32,
-                            width as u32,
-                            height as u32,
-                            0,
-                            0,
-                        );
-                    }
-                    self.pan_last = Some((position.x, position.y));
+                if self.pan_button.is_some()
+                    && let Some((last_x, last_y)) = self.cursor
+                {
+                    let size = frame_size(&window, window.inner_size());
+                    self.camera.pan(
+                        (position.x - last_x) as f32,
+                        (position.y - last_y) as f32,
+                        self.grid.width() as u32,
+                        self.grid.height() as u32,
+                        size.width,
+                        size.height,
+                    );
                 }
                 self.cursor = Some((position.x, position.y));
-            }
-            WindowEvent::MouseInput { state, button, .. } if !consumed => {
-                let down = state == ElementState::Pressed;
-                let shift = self.modifiers.state().shift_key();
-                match button {
-                    MouseButton::Left => self.painting = down,
-                    MouseButton::Middle => self.panning = down,
-                    MouseButton::Right if shift => self.erasing = down,
-                    MouseButton::Right => self.panning = down,
-                    _ => {}
-                }
-                if !down && !self.panning {
-                    self.pan_last = None;
-                }
-                if !self.painting && !self.erasing {
-                    self.last_cell = None;
+                if let Some(state) = &self.egui {
+                    let ctx = state.egui_ctx();
+                    let point =
+                        egui::pos2(position.x as f32, position.y as f32) / ctx.pixels_per_point();
+                    self.over_panel = ctx
+                        .layer_id_at(point)
+                        .is_some_and(|layer| layer.order != egui::Order::Background);
+                    if self.over_panel {
+                        self.last_cell = None;
+                    }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !self.over_panel => {
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.mouse_button(button, state, self.modifiers.state().shift_key(), consumed)
+            }
+            WindowEvent::Focused(false) => {
+                self.painting = false;
+                self.erasing = false;
+                self.pan_button = None;
+                self.cursor = None;
+                self.last_cell = None;
+                self.modifiers = Modifiers::default();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.last_cell = None;
+            }
+            WindowEvent::MouseWheel { delta, .. } if !consumed && !self.over_panel => {
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(offset) => offset.y as f32 / 40.0,
                 };
+                if steps == 0.0 {
+                    return;
+                }
                 let flags = self.modifiers.state();
                 if flags.control_key() || flags.alt_key() || flags.super_key() {
                     let factor = if steps > 0.0 { 1.1 } else { 0.9 };
                     let (cursor_x, cursor_y) = self.cursor.unwrap_or((0.0, 0.0));
                     self.camera
                         .zoom_at(cursor_x as f32, cursor_y as f32, factor);
+                    let size = frame_size(&window, window.inner_size());
+                    self.camera.constrain(
+                        self.grid.width() as u32,
+                        self.grid.height() as u32,
+                        size.width,
+                        size.height,
+                    );
                 } else if steps > 0.0 {
                     self.controls.radius = (self.controls.radius + 1).min(RADIUS_MAX);
                     self.log_brush();
@@ -262,7 +260,11 @@ impl ApplicationHandler for App {
                     self.log_brush();
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if !consumed => {
                 if event.state != ElementState::Pressed || event.repeat {
                     return;
                 }
@@ -276,6 +278,91 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn new() -> Self {
+        Self {
+            window: None,
+            gpu: Rc::new(std::cell::RefCell::new(None)),
+            grid: Grid::demo_world(),
+            controls: Controls::new(),
+            over_panel: false,
+            fps: 0.0,
+            last_frame: web_time::Instant::now(),
+            egui: None,
+            painting: false,
+            erasing: false,
+            cursor: None,
+            last_cell: None,
+            notice: Rc::new(RefCell::new(String::new())),
+            inbox: Rc::new(RefCell::new(None)),
+            link_checked: false,
+            camera: {
+                let (width, height) = grid::world_size();
+                Camera::centered(width as u32, height as u32, 1024, 600)
+            },
+            pan_button: None,
+            pending_strokes: Vec::new(),
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn mouse_button(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+        shift: bool,
+        consumed: bool,
+    ) {
+        let down = state == ElementState::Pressed;
+        if down && (consumed || self.over_panel) {
+            return;
+        }
+        if !down
+            && !consumed
+            && !self.over_panel
+            && ((button == MouseButton::Left && self.painting)
+                || (button == MouseButton::Right && self.erasing))
+            && let Some(stroke) = self.stroke_for()
+            && (stroke.from_x, stroke.from_y) != (stroke.to_x, stroke.to_y)
+        {
+            self.pending_strokes.push(stroke);
+        }
+        match button {
+            MouseButton::Left => self.painting = down,
+            MouseButton::Right if down && shift => self.erasing = true,
+            MouseButton::Middle | MouseButton::Right if down => self.pan_button = Some(button),
+            MouseButton::Middle | MouseButton::Right => {
+                if button == MouseButton::Right {
+                    self.erasing = false;
+                }
+                if self.pan_button == Some(button) {
+                    self.pan_button = None;
+                }
+            }
+            _ => return,
+        }
+        if down && (button == MouseButton::Left || (button == MouseButton::Right && self.erasing)) {
+            if let Some(stroke) = self.stroke_for() {
+                self.pending_strokes.push(stroke);
+            }
+        } else if !self.painting && !self.erasing {
+            self.last_cell = None;
+        }
+    }
+
+    fn resize(&mut self, size: Size) {
+        if size.width > 0 && size.height > 0 {
+            self.camera.constrain(
+                self.grid.width() as u32,
+                self.grid.height() as u32,
+                size.width,
+                size.height,
+            );
+        }
+        if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
+            gpu.resize(size);
+        }
+    }
+
     fn key(&mut self, key: KeyCode) {
         if let Some(material) = digit(key).and_then(ui::material_for_key) {
             self.set_material(material);
@@ -290,7 +377,11 @@ impl App {
                 self.controls.passes = (self.controls.passes + 1).min(PASSES_MAX);
                 eprintln!("passes {}", self.controls.passes);
             }
-            KeyCode::KeyC => self.controls.clear = true,
+            KeyCode::KeyC => {
+                self.pending_strokes.clear();
+                self.last_cell = None;
+                self.controls.clear = true;
+            }
             KeyCode::KeyS => self.controls.save = true,
             KeyCode::KeyL => self.controls.load = true,
             KeyCode::KeyB => {
@@ -327,6 +418,16 @@ impl App {
     }
 
     fn redraw(&mut self, window: &Window) {
+        // Only run egui when its texture updates have a frame to render into.
+        let frame = {
+            let mut slot = self.gpu.borrow_mut();
+            let Some(gpu) = slot.as_mut() else { return };
+            let Some(frame) = gpu.acquire_frame() else {
+                window.request_redraw();
+                return;
+            };
+            frame
+        };
         let now = web_time::Instant::now();
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -347,7 +448,12 @@ impl App {
         );
         self.take_inbox();
         self.open_link();
+        let keyboard_clear = std::mem::take(&mut self.controls.clear);
         let ui = self.run_panel(window);
+        if self.controls.clear {
+            self.pending_strokes.clear();
+            self.last_cell = None;
+        }
         if self.controls.save {
             self.controls.save = false;
             self.save_world();
@@ -380,12 +486,13 @@ impl App {
                 eprintln!("bloom off");
             }
         }
-        let stroke = self.stroke_for(window);
-        let clear = self.controls.clear;
-        self.controls.clear = false;
+        let mut strokes = std::mem::take(&mut self.pending_strokes);
+        strokes.extend(self.stroke_for());
+        let clear = std::mem::take(&mut self.controls.clear) || keyboard_clear;
         if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
             gpu.set_camera(self.camera);
             gpu.draw(
+                frame,
                 window,
                 &self.grid,
                 Paint {
@@ -393,12 +500,11 @@ impl App {
                     clear,
                     bloom: self.controls.bloom,
                     passes: self.controls.passes,
-                    stroke,
+                    strokes,
                 },
                 ui,
             );
         }
-        window.request_redraw();
     }
 
     fn run_panel(&mut self, window: &Window) -> Option<EguiFrame> {
@@ -485,12 +591,16 @@ impl App {
 
     fn load_world(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        match std::fs::read(world::FILE_NAME) {
+        match world::read_file() {
             Ok(bytes) => self.apply_file(&bytes),
             Err(err) => self.set_notice(format!("could not load {}: {err}", world::FILE_NAME)),
         }
         #[cfg(target_arch = "wasm32")]
-        web::pick_file(Rc::clone(&self.inbox));
+        {
+            // A slower read from an earlier picker must not replace this selection.
+            self.inbox = Rc::new(RefCell::new(None));
+            web::pick_file(Rc::clone(&self.inbox));
+        }
     }
 
     fn share_world(&mut self) {
@@ -535,6 +645,18 @@ impl App {
             self.set_notice(err);
             return;
         }
+        if saved.width as usize != self.grid.width() || saved.height as usize != self.grid.height()
+        {
+            let view = self
+                .window
+                .as_ref()
+                .map(|window| frame_size(window, window.inner_size()))
+                .unwrap_or(Size {
+                    width: 1024,
+                    height: 600,
+                });
+            self.camera = Camera::centered(saved.width, saved.height, view.width, view.height);
+        }
         if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
             gpu.store(&self.grid);
             gpu.wake_all();
@@ -569,7 +691,7 @@ impl App {
         });
     }
 
-    fn stroke_for(&mut self, _window: &Window) -> Option<Stroke> {
+    fn stroke_for(&mut self) -> Option<Stroke> {
         if self.over_panel || (!self.painting && !self.erasing) {
             self.last_cell = None;
             return None;
@@ -608,7 +730,7 @@ fn write_file(words: &[u32]) -> String {
         crate::grid::world_size().0 as u32,
         crate::grid::world_size().1 as u32,
     ) {
-        Ok(bytes) => match std::fs::write(world::FILE_NAME, bytes) {
+        Ok(bytes) => match world::replace_file(std::path::Path::new("."), &bytes) {
             Ok(()) => format!("saved {}", world::FILE_NAME),
             Err(err) => format!("could not save {}: {err}", world::FILE_NAME),
         },
@@ -618,17 +740,61 @@ fn write_file(words: &[u32]) -> String {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn native_link(words: &[u32]) -> String {
-    match world::encode(
-        words,
-        crate::grid::world_size().0 as u32,
-        crate::grid::world_size().1 as u32,
-    )
-    .and_then(|bytes| world::hash_fragment(&bytes))
-    {
+    match world::desktop_fragment(words) {
         Ok(fragment) => {
             eprintln!("link #{fragment}");
             "printed a link for this world".to_string()
         }
         Err(err) => err,
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use ElementState::{Pressed, Released};
+
+    #[test]
+    fn clear_between_redraws_preserves_only_later_strokes() {
+        let mut app = App::new();
+        app.cursor = Some((100.0, 40.0));
+        app.mouse_button(MouseButton::Left, Pressed, false, false);
+        app.mouse_button(MouseButton::Left, Released, false, false);
+        app.key(KeyCode::KeyC);
+        assert!(app.controls.clear);
+        assert!(app.pending_strokes.is_empty());
+        app.cursor = Some((140.0, 40.0));
+        app.mouse_button(MouseButton::Left, Pressed, false, false);
+        assert_eq!(app.pending_strokes.len(), 1);
+    }
+
+    #[test]
+    fn drag_between_redraws_reaches_both_endpoints() {
+        let mut app = App::new();
+        app.cursor = Some((100.0, 40.0));
+        app.mouse_button(MouseButton::Left, Pressed, false, false);
+        app.cursor = Some((140.0, 40.0));
+        app.mouse_button(MouseButton::Left, Released, false, false);
+        let stroke = app.pending_strokes.last().expect("queued stroke");
+        assert_eq!(stroke.to_x - stroke.from_x, 20);
+        assert_eq!(stroke.to_y, stroke.from_y);
+    }
+
+    #[test]
+    fn releasing_shift_before_right_button_ends_erase() {
+        let mut app = App::new();
+        app.mouse_button(MouseButton::Right, Pressed, true, false);
+        assert!(app.erasing);
+        app.mouse_button(MouseButton::Right, Released, false, false);
+        assert!(!app.erasing);
+    }
+
+    #[test]
+    fn releasing_over_panel_ends_world_stroke() {
+        let mut app = App::new();
+        app.mouse_button(MouseButton::Left, Pressed, false, false);
+        assert!(app.painting);
+        app.mouse_button(MouseButton::Left, Released, false, true);
+        assert!(!app.painting);
     }
 }

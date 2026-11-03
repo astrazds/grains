@@ -2,11 +2,12 @@ pub const GRID_WIDTH: usize = 512;
 pub const GRID_HEIGHT: usize = 288;
 pub const CELL_COUNT: usize = GRID_WIDTH * GRID_HEIGHT;
 pub const CHUNK: usize = 64;
+pub const WEB_WORLD: (usize, usize) = (1024, 576);
 
 pub fn world_size() -> (usize, usize) {
     #[cfg(target_arch = "wasm32")]
     {
-        (1024, 576)
+        WEB_WORLD
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -316,9 +317,22 @@ impl Camera {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32, world_w: u32, world_h: u32, view_w: u32, view_h: u32) {
-        self.cell_x = (self.cell_x - dx / self.zoom).clamp(0.0, world_w as f32);
-        self.cell_y = (self.cell_y - dy / self.zoom).clamp(0.0, world_h as f32);
-        let _ = (view_w, view_h);
+        self.cell_x -= dx / self.zoom;
+        self.cell_y -= dy / self.zoom;
+        self.constrain(world_w, world_h, view_w, view_h);
+    }
+
+    pub fn constrain(&mut self, world_w: u32, world_h: u32, view_w: u32, view_h: u32) {
+        let limit = |origin: f32, world: u32, view: u32| {
+            let spare = world as f32 - view as f32 / self.zoom;
+            if spare < 0.0 {
+                spare * 0.5
+            } else {
+                origin.clamp(0.0, spare)
+            }
+        };
+        self.cell_x = limit(self.cell_x, world_w, view_w);
+        self.cell_y = limit(self.cell_y, world_h, view_h);
     }
 
     pub fn zoom_at(&mut self, cursor_x: f32, cursor_y: f32, factor: f32) {
@@ -375,14 +389,16 @@ pub fn physical_pixel(css: f64, ratio: f64) -> i32 {
 }
 
 pub fn letterbox(size: Size) -> Option<Fit> {
+    letterbox_world(size, GRID_WIDTH as u32, GRID_HEIGHT as u32)
+}
+
+pub(crate) fn letterbox_world(size: Size, width: u32, height: u32) -> Option<Fit> {
     if size.width == 0 || size.height == 0 {
         return None;
     }
-    let scale = (size.width / GRID_WIDTH as u32)
-        .min(size.height / GRID_HEIGHT as u32)
-        .max(1);
-    let span_x = GRID_WIDTH as i32 * scale as i32;
-    let span_y = GRID_HEIGHT as i32 * scale as i32;
+    let scale = (size.width / width).min(size.height / height).max(1);
+    let span_x = width as i32 * scale as i32;
+    let span_y = height as i32 * scale as i32;
     Some(Fit {
         scale,
         origin_x: (size.width as i32 - span_x) / 2,
@@ -397,18 +413,8 @@ pub struct Grid {
 }
 
 impl Grid {
-    pub fn from_fn(mut each: impl FnMut(usize, usize) -> Cell) -> Self {
-        let mut cells = vec![Cell::pack(0, 0, 0, 0); CELL_COUNT];
-        for y in 0..GRID_HEIGHT {
-            for x in 0..GRID_WIDTH {
-                cells[index(x, y)] = each(x, y);
-            }
-        }
-        Self {
-            width: GRID_WIDTH,
-            height: GRID_HEIGHT,
-            cells: cells.into_boxed_slice(),
-        }
+    pub fn from_fn(each: impl FnMut(usize, usize) -> Cell) -> Self {
+        Self::filled(GRID_WIDTH, GRID_HEIGHT, each)
     }
 
     pub fn filled(width: usize, height: usize, mut each: impl FnMut(usize, usize) -> Cell) -> Self {
@@ -456,13 +462,13 @@ impl Grid {
     }
 
     pub fn place(&mut self, width: u32, height: u32, words: &[u32]) -> Result<(), String> {
-        if words.len() != width as usize * height as usize {
-            return Err("this world has the wrong number of cells".to_string());
-        }
         if width as usize > self.width || height as usize > self.height {
             return Err(format!(
                 "this world is {width} by {height}, which is larger than grains can load"
             ));
+        }
+        if words.len() != width as usize * height as usize {
+            return Err("this world has the wrong number of cells".to_string());
         }
         for cell in self.cells.iter_mut() {
             *cell = Cell::pack(EMPTY, 0, 0, 0);
@@ -495,11 +501,20 @@ impl Grid {
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Cell {
-        self.cells[y * self.width + x]
+        self.cells[self.index(x, y)]
     }
 
     pub fn set(&mut self, x: usize, y: usize, cell: Cell) {
-        self.cells[y * self.width + x] = cell;
+        let index = self.index(x, y);
+        self.cells[index] = cell;
+    }
+
+    fn index(&self, x: usize, y: usize) -> usize {
+        assert!(
+            x < self.width && y < self.height,
+            "{x},{y} outside the grid"
+        );
+        y * self.width + x
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -517,14 +532,6 @@ impl Grid {
             cells: cells.into_boxed_slice(),
         })
     }
-}
-
-fn index(x: usize, y: usize) -> usize {
-    assert!(
-        x < GRID_WIDTH && y < GRID_HEIGHT,
-        "{x},{y} outside the grid"
-    );
-    y * GRID_WIDTH + x
 }
 
 fn ledge(x: usize, y: usize) -> bool {
@@ -643,6 +650,20 @@ mod tests {
             Some((11, 4))
         );
         assert_eq!(super::cell_at_camera(300.0, 0.0, camera, 128, 128), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn column_past_the_grid_does_not_alias_the_next_row() {
+        let mut grid = super::Grid::filled(4, 2, |_, _| Cell::pack(0, 0, 0, 0));
+        grid.set(4, 0, Cell::pack(super::STONE, 0, 0, 0));
+    }
+
+    #[test]
+    fn camera_pan_keeps_the_viewport_inside_the_world() {
+        let mut camera = super::Camera::centered(1024, 576, 512, 288);
+        camera.pan(-5000.0, -5000.0, 1024, 576, 512, 288);
+        assert_eq!((camera.cell_x, camera.cell_y), (512.0, 288.0));
     }
 
     #[test]

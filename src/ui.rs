@@ -96,6 +96,7 @@ pub fn show(
     egui::Window::new("grains")
         .default_pos([12.0, 12.0])
         .resizable(false)
+        .vscroll(true)
         .show(ctx, |ui| {
             panel(ui, controls, fps, notice, awake, chunks);
         });
@@ -204,6 +205,21 @@ mod tests {
         assert_eq!(rows[WOOD as usize].key, Some('7'));
         assert_eq!(rows[crate::grid::FIRE as usize].key, Some('8'));
         assert_eq!(rows[crate::grid::TNT as usize].key, Some('0'));
+    }
+
+    #[test]
+    fn panel_font_has_label_glyphs() {
+        let ctx = egui::Context::default();
+        ctx.run_pass(Default::default(), |ctx| {
+            ctx.fonts_mut(|fonts| {
+                let font = egui::FontId::proportional(14.0);
+                assert!(fonts.has_glyphs(&font, "grains 0123456789"));
+                for swatch in palette() {
+                    assert!(fonts.has_glyphs(&font, swatch.name), "{}", swatch.name);
+                }
+            });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
