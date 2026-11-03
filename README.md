@@ -11,7 +11,7 @@ mise install
 cargo run
 ```
 
-The window title is grains. The inner size is 1024 by 600 physical pixels. The world is 2048 by 1152 cells on the desktop and 1024 by 576 in the browser, split into 64 by 64 chunks that sleep when they stop changing. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Sand, stone, and wood pick up grain from the colour byte on each cell. Fire shifts from yellow-white to deep red as it burns. Water and oil stay a little translucent, and smoke fades into the background.
+The window title is grains. The inner size is 1024 by 600 physical pixels. The world is 2048 by 1152 cells on the desktop and 1024 by 576 in the browser, split into 64 by 64 chunks. Settled chunks sleep on the desktop. The browser currently simulates all chunks. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Sand, stone, and wood pick up grain from the colour byte on each cell. Fire shifts from yellow-white to deep red as it burns. Water and oil stay a little translucent, and smoke fades into the background.
 
 ## Controls
 
@@ -19,7 +19,7 @@ Left click paints. Shift and right click erases. Drag with the middle or right m
 
 Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, `9` for steam, or `0` for tnt. Tnt falls like sand. Touching fire detonates it: stone stays, loose grains are thrown clear, and tnt beside the blast goes off too. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
 
-Press `S` to save the grid to `world.grains`, or `L` to load that file. The panel has the same buttons. A file with the wrong magic, the wrong version, or a truncated body is refused, and the message is shown in the panel. In the browser, Save downloads `world.grains` and Load opens a file picker. Copy link puts a small world in the page address.
+Press `S` to save the grid to `world.grains`, or `L` to load that file. The panel has the same buttons. A file with the wrong magic, the wrong version, or a truncated body is refused, and the message is shown in the panel. In the browser, Save downloads `world.grains` and Load opens a file picker. Copy link puts a small world in the page address. On desktop it prints a fragment for the browser, cropping only empty outer rows and columns to fit the browser world. If the occupied region is too large, use a save file. Loading an older, smaller world places it at the origin and centres the camera on it.
 
 ## Build the web page
 
@@ -37,7 +37,3 @@ Serve `dist` over HTTP and open it in a browser with WebGPU.
 ## GitHub Pages
 
 GitHub Pages deploys from `main` only after the repo's Pages source is set to GitHub Actions.
-
-## Roadmap
-
-9. A colourize pass that replaces the debug colours with a palette.

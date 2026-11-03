@@ -3,6 +3,9 @@
 // rather than headless. Screenshots stay empty; the page publishes three
 // canvas pixels at window.grainsPixels when opened with ?probe=1.
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright");
 
@@ -14,48 +17,53 @@ if (!root) {
 
 const display = process.env.GRAINS_DISPLAY || ":98";
 const port = process.env.GRAINS_PORT || "8876";
-const children = [];
-
-function start(command, args, options = {}) {
-  const child = spawn(command, args, { stdio: "ignore", ...options });
-  children.push(child);
-  return child;
-}
-
-function stop() {
-  for (const child of children) {
-    child.kill("SIGTERM");
+const linux = process.platform === "linux";
+const xvfb = linux
+  ? spawn("Xvfb", [display, "-screen", "0", "1280x800x24"], { stdio: "ignore" })
+  : null;
+const assets = new Map([
+  ["/", ["index.html", "text/html"]],
+  ["/grains.js", ["grains.js", "text/javascript"]],
+  ["/grains_bg.wasm", ["grains_bg.wasm", "application/wasm"]],
+]);
+const server = createServer(async (request, response) => {
+  const asset = assets.get(request.url.split("?")[0]);
+  if (!asset) return response.writeHead(404).end();
+  try {
+    const data = await readFile(join(root, asset[0]));
+    response.writeHead(200, { "Content-Type": asset[1] }).end(data);
+  } catch {
+    response.writeHead(500).end();
   }
-}
-
-start("Xvfb", [display, "-screen", "0", "1280x800x24"]);
-start("python3", ["-m", "http.server", port, "--bind", "127.0.0.1"], { cwd: root });
-await new Promise((resolve) => setTimeout(resolve, 800));
+});
+await new Promise((resolve) => server.listen(Number(port), "127.0.0.1", resolve));
+if (linux) await new Promise((resolve) => setTimeout(resolve, 800));
 
 const failures = [];
-const browser = await chromium.launch({
-  headless: false,
-  env: {
-    ...process.env,
-    DISPLAY: display,
-    VK_DRIVER_FILES: process.env.VK_DRIVER_FILES ?? "",
-    LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH ?? "",
-  },
-  args: [
-    "--enable-unsafe-webgpu",
-    "--enable-features=Vulkan",
-    "--use-angle=vulkan",
-    "--use-vulkan=native",
-    "--ignore-gpu-blocklist",
-    "--disable-gpu-sandbox",
-    "--no-sandbox",
-  ],
-});
-
 const consoleLines = [];
 let page;
+let browser;
 try {
-  page = await browser.newPage({ viewport: { width: 1024, height: 600 } });
+  browser = await chromium.launch({
+    headless: false,
+    channel: process.platform === "win32" ? "chrome" : undefined,
+    env: {
+      ...process.env,
+      DISPLAY: display,
+    },
+    args: [
+      "--enable-unsafe-webgpu",
+      ...(linux ? ["--enable-features=Vulkan", "--use-angle=vulkan", "--use-vulkan=native"] : []),
+      "--ignore-gpu-blocklist",
+      "--disable-gpu-sandbox",
+      "--no-sandbox",
+    ],
+  });
+  page = await browser.newPage({
+    viewport: { width: 1024, height: 600 },
+    deviceScaleFactor: 1.5,
+    colorScheme: "dark",
+  });
   page.on("console", (msg) => {
     const text = msg.text();
     consoleLines.push(`${msg.type()}: ${text}`);
@@ -73,32 +81,46 @@ try {
   await page.waitForFunction(
     () => {
       const pixels = window.grainsPixels;
-      // Corner is the tonemapped sky, so the frame was drawn.
-      // The panel pixel has to be the light egui window, not that sky.
-      if (!pixels || pixels.corner[0] >= 80) {
-        return false;
-      }
-      return pixels.panel[0] > 160 && pixels.panel[1] > 160 && pixels.panel[2] > 160;
+      if (!pixels?.corner || !pixels.panel || !pixels.stroke) return false;
+      // The sky is blue-tinted. The panel fill is neutral in both egui themes.
+      const spread = (pixel) => Math.max(...pixel.slice(0, 3)) - Math.min(...pixel.slice(0, 3));
+      return spread(pixels.corner) > 8 && spread(pixels.panel) <= 3;
     },
     null,
     { timeout: 120000 },
   );
+  await page.locator("#grains").focus();
+  await page.keyboard.press("Space");
+  await page.keyboard.press("2"); // Stone stays where the stroke was sampled.
   const before = await page.evaluate(() => window.grainsPixels.stroke.slice());
   await page.mouse.move(700, 300);
   await page.mouse.down();
   await page.waitForTimeout(500);
   await page.mouse.move(760, 360, { steps: 20 });
-  await page.mouse.up();
+  await page.mouse.move(748, 348);
   await page.waitForFunction(
     (previous) =>
       window.grainsPixels.stroke.some((channel, index) => Math.abs(channel - previous[index]) > 20),
     before,
-    { timeout: 20000 },
+    { timeout: 30000 },
   );
+  await page.mouse.up();
+
+  const unavailable = await browser.newPage();
+  unavailable.on("pageerror", (err) => failures.push(err.message));
+  await unavailable.addInitScript(() => {
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (kind, ...options) {
+      return kind === "webgpu" ? null : getContext.call(this, kind, ...options);
+    };
+  });
+  await unavailable.goto(`http://127.0.0.1:${port}/`);
+  await unavailable.locator("#grains-webgpu").waitFor({ state: "visible", timeout: 15000 });
+  await unavailable.close();
 } catch (err) {
   failures.push(String(err));
   const dump = await page
-    .evaluate(() => ({
+    ?.evaluate(() => ({
       pixels: window.grainsPixels ?? null,
       search: location.search,
       width: document.querySelector("#grains")?.width ?? 0,
@@ -108,8 +130,9 @@ try {
   failures.push(JSON.stringify(dump));
   failures.push(consoleLines.slice(-15).join("\n"));
 } finally {
-  await browser.close();
-  stop();
+  await browser?.close();
+  xvfb?.kill();
+  server.close();
 }
 
 if (failures.length > 0) {
