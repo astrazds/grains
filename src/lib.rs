@@ -40,6 +40,7 @@ struct App {
     painting: bool,
     erasing: bool,
     paused: bool,
+    bloom: bool,
     clear: bool,
     cursor: Option<(f64, f64)>,
     last_cell: Option<(i32, i32)>,
@@ -48,6 +49,7 @@ struct App {
 pub fn run() {
     eprintln!("brush sand radius 2");
     eprintln!("passes 4");
+    eprintln!("bloom on");
     let event_loop = EventLoop::new().expect("event loop");
     let app = App {
         window: None,
@@ -59,6 +61,7 @@ pub fn run() {
         painting: false,
         erasing: false,
         paused: false,
+        bloom: true,
         clear: false,
         cursor: None,
         last_cell: None,
@@ -157,6 +160,7 @@ impl ApplicationHandler for App {
                         Paint {
                             paused: self.paused,
                             clear,
+                            bloom: self.bloom,
                             passes: self.passes,
                             stroke,
                         },
@@ -214,6 +218,14 @@ impl ApplicationHandler for App {
                         eprintln!("passes {}", self.passes);
                     }
                     PhysicalKey::Code(KeyCode::KeyC) => self.clear = true,
+                    PhysicalKey::Code(KeyCode::KeyB) => {
+                        self.bloom = !self.bloom;
+                        if self.bloom {
+                            eprintln!("bloom on");
+                        } else {
+                            eprintln!("bloom off");
+                        }
+                    }
                     PhysicalKey::Code(KeyCode::Space) => {
                         self.paused = !self.paused;
                         if self.paused {

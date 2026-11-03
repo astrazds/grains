@@ -36,6 +36,8 @@ pub(crate) struct Gpu {
     brush_uniform: wgpu::Buffer,
     brush_groups: [wgpu::BindGroup; 2],
     brush_pipeline: wgpu::ComputePipeline,
+    format: wgpu::TextureFormat,
+    bloom: Option<BloomTargets>,
     // Bind groups borrow this buffer. The field keeps it alive.
     #[allow(dead_code)]
     materials: wgpu::Buffer,
@@ -90,9 +92,17 @@ pub(crate) struct Stroke {
 
 const _: () = assert!(std::mem::size_of::<Stroke>() == 32);
 
+pub(crate) struct Scene {
+    pub rgba: Vec<u8>,
+    // The bloom test reads the linear frame. The window does not.
+    #[allow(dead_code)]
+    pub linear: Vec<u8>,
+}
+
 pub(crate) struct Paint {
     pub paused: bool,
     pub clear: bool,
+    pub bloom: bool,
     pub passes: u32,
     pub stroke: Option<Stroke>,
 }
@@ -129,17 +139,24 @@ impl Gpu {
     }
 
     pub(crate) fn render_rgba(grid: &Grid, size: Size) -> Result<Vec<u8>, NoAdapter> {
+        Ok(Self::render_scene(grid, size, false)?.rgba)
+    }
+
+    pub(crate) fn render_scene(grid: &Grid, size: Size, bloom: bool) -> Result<Scene, NoAdapter> {
         if size.width == 0 || size.height == 0 {
-            return Ok(Vec::new());
+            return Ok(Scene {
+                rgba: Vec::new(),
+                linear: Vec::new(),
+            });
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let gpu = pollster::block_on(Self::open(None, size))?;
-            Ok(gpu.read_rgba(grid, size))
+            let mut gpu = pollster::block_on(Self::open(None, size))?;
+            Ok(gpu.read_scene(grid, size, bloom))
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = grid;
+            let _ = (grid, bloom);
             Err(NoAdapter { names: Vec::new() })
         }
     }
@@ -274,6 +291,8 @@ impl Gpu {
             brush_uniform: gpu_parts.brush_uniform,
             brush_groups: gpu_parts.brush_groups,
             brush_pipeline: gpu_parts.brush_pipeline,
+            format,
+            bloom: None,
             materials: gpu_parts.materials,
             reactions: gpu_parts.reactions,
         })
@@ -324,12 +343,7 @@ impl Gpu {
             self.apply_brush(stroke);
         }
         if input.paused {
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            self.draw_cells(&mut encoder, &view, self.size, self.front);
-            self.queue.submit([encoder.finish()]);
+            self.present(texture, self.front, input.bloom);
             return;
         }
         for _ in 0..input.passes {
@@ -337,16 +351,24 @@ impl Gpu {
             self.step(offset);
             self.passes += 1;
         }
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.present(texture, self.front, input.bloom);
+    }
+
+    fn present(&mut self, texture: &wgpu::Texture, index: usize, bloom: bool) {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.draw_cells(&mut encoder, &view, self.size, self.front);
+        if bloom {
+            self.draw_bloom(&mut encoder, texture, index);
+        } else {
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.draw_cells(&mut encoder, &view, self.size, index);
+        }
         self.queue.submit([encoder.finish()]);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn read_rgba(&self, grid: &Grid, size: Size) -> Vec<u8> {
+    fn read_scene(&mut self, grid: &Grid, size: Size, bloom: bool) -> Scene {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -366,56 +388,23 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
-        self.draw_cells(&mut encoder, &view, size, 0);
-        let stride = padded_row_bytes(size.width);
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: u64::from(stride) * u64::from(size.height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride),
-                    rows_per_image: Some(size.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: size.width,
-                height: size.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit([encoder.finish()]);
-        let slice = buffer.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll");
-        receiver.recv().expect("map callback").expect("map buffer");
-        let mapped = slice.get_mapped_range().expect("mapped range");
-        let row = (size.width * 4) as usize;
-        let stride = stride as usize;
-        let mut pixels = Vec::with_capacity(row * size.height as usize);
-        for y in 0..size.height as usize {
-            let start = y * stride;
-            pixels.extend_from_slice(&mapped[start..start + row]);
+        if bloom {
+            self.draw_bloom(&mut encoder, &texture, 0);
+        } else {
+            self.draw_cells(&mut encoder, &view, size, 0);
         }
-        drop(mapped);
-        buffer.unmap();
-        pixels
+        let rgba = stage_copy(&self.device, &mut encoder, &texture, size, 4);
+        let linear = bloom.then(|| {
+            let lit = &self.bloom.as_ref().unwrap().lit;
+            stage_copy(&self.device, &mut encoder, lit, size, 8)
+        });
+        self.queue.submit([encoder.finish()]);
+        Scene {
+            rgba: take_pixels(&self.device, &rgba, size, 4),
+            linear: linear
+                .map(|buffer| take_pixels(&self.device, &buffer, size, 8))
+                .unwrap_or_default(),
+        }
     }
 
     fn step(&mut self, offset: u32) {
@@ -498,7 +487,7 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.draw_cells(&mut encoder, &view, size, index);
-        let stride = padded_row_bytes(size.width);
+        let stride = padded_row_bytes(size.width, 4);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: u64::from(stride) * u64::from(size.height),
@@ -595,9 +584,117 @@ impl Gpu {
         size: Size,
         index: usize,
     ) {
-        let Some(fit) = letterbox(size) else {
+        let Some((x, y, width, height)) = self.prepare_frame(size) else {
             return;
         };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(color_attachment(view, letterbox_color()))],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.draw_groups[index], &[]);
+        pass.set_viewport(x, y, width, height, 0.0, 1.0);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn draw_bloom(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        index: usize,
+    ) {
+        self.ensure_bloom();
+        let Some((x, y, width, height)) = self.prepare_frame(self.size) else {
+            return;
+        };
+        let hdr_view = self
+            .bloom
+            .as_ref()
+            .unwrap()
+            .hdr
+            .create_view(&Default::default());
+        let glow_view = self
+            .bloom
+            .as_ref()
+            .unwrap()
+            .glow
+            .create_view(&Default::default());
+        {
+            let bloom = self.bloom.as_ref().unwrap();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[
+                    Some(color_attachment(&hdr_view, letterbox_color())),
+                    Some(color_attachment(&glow_view, wgpu::Color::TRANSPARENT)),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&bloom.grid);
+            pass.set_bind_group(0, &self.draw_groups[index], &[]);
+            pass.set_viewport(x, y, width, height, 0.0, 1.0);
+            pass.draw(0..3, 0..1);
+        }
+        // Quarter-res bright pass, horizontal blur, vertical blur, composite, then the swapchain blit.
+        self.bloom_pass(
+            encoder,
+            Stage::Bright,
+            &self.bloom.as_ref().unwrap().low_view[0],
+        );
+        self.bloom_pass(
+            encoder,
+            Stage::BlurX,
+            &self.bloom.as_ref().unwrap().low_view[1],
+        );
+        self.bloom_pass(
+            encoder,
+            Stage::BlurY,
+            &self.bloom.as_ref().unwrap().low_view[0],
+        );
+        self.bloom_pass(
+            encoder,
+            Stage::Composite,
+            &self.bloom.as_ref().unwrap().lit_view,
+        );
+        let target_view = target.create_view(&Default::default());
+        self.bloom_pass(encoder, Stage::Blit, &target_view);
+    }
+
+    fn bloom_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        stage: Stage,
+        view: &wgpu::TextureView,
+    ) {
+        let bloom = self.bloom.as_ref().unwrap();
+        let (pipeline, group) = match stage {
+            Stage::Bright => (&bloom.bright, &bloom.bright_group),
+            Stage::BlurX => (&bloom.blur_x, &bloom.blur_from[0]),
+            Stage::BlurY => (&bloom.blur_y, &bloom.blur_from[1]),
+            Stage::Composite => (&bloom.composite, &bloom.composite_group),
+            Stage::Blit => (&bloom.blit, &bloom.blit_group),
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(color_attachment(view, wgpu::Color::TRANSPARENT))],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn prepare_frame(&self, size: Size) -> Option<(f32, f32, f32, f32)> {
+        let fit = letterbox(size)?;
         let uniforms = Uniforms {
             origin_x: fit.origin_x,
             origin_y: fit.origin_y,
@@ -610,29 +707,19 @@ impl Gpu {
         };
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniforms));
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(letterbox_color()),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        let Some((x, y, width, height)) = viewport(fit, size) else {
+        viewport(fit, size)
+    }
+
+    fn ensure_bloom(&mut self) {
+        if self
+            .bloom
+            .as_ref()
+            .is_some_and(|bloom| bloom.frame == self.size)
+        {
             return;
-        };
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.draw_groups[index], &[]);
-        pass.set_viewport(x, y, width, height, 0.0, 1.0);
-        pass.draw(0..3, 0..1);
+        }
+        let layout = self.pipeline.get_bind_group_layout(0);
+        self.bloom = Some(bloom_targets(&self.device, self.format, &layout, self.size));
     }
 }
 
@@ -1050,6 +1137,308 @@ fn letterbox_color() -> wgpu::Color {
     }
 }
 
+fn color_attachment(
+    view: &wgpu::TextureView,
+    clear: wgpu::Color,
+) -> wgpu::RenderPassColorAttachment<'_> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(clear),
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
+enum Stage {
+    Bright,
+    BlurX,
+    BlurY,
+    Composite,
+    Blit,
+}
+
+struct BloomTargets {
+    frame: Size,
+    grid: wgpu::RenderPipeline,
+    bright: wgpu::RenderPipeline,
+    blur_x: wgpu::RenderPipeline,
+    blur_y: wgpu::RenderPipeline,
+    composite: wgpu::RenderPipeline,
+    blit: wgpu::RenderPipeline,
+    bright_group: wgpu::BindGroup,
+    blur_from: [wgpu::BindGroup; 2],
+    composite_group: wgpu::BindGroup,
+    blit_group: wgpu::BindGroup,
+    // Groups borrow the views, and the views borrow the textures.
+    #[allow(dead_code)]
+    hdr_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    glow_view: wgpu::TextureView,
+    low_view: [wgpu::TextureView; 2],
+    lit_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    hdr: wgpu::Texture,
+    #[allow(dead_code)]
+    glow: wgpu::Texture,
+    #[allow(dead_code)]
+    low: [wgpu::Texture; 2],
+    #[allow(dead_code)]
+    sampler: wgpu::Sampler,
+    // Native frame readback copies this. The window only samples the view.
+    #[allow(dead_code)]
+    lit: wgpu::Texture,
+}
+
+fn bloom_targets(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    draw_layout: &wgpu::BindGroupLayout,
+    frame: Size,
+) -> BloomTargets {
+    let low_w = frame.width.div_ceil(4).max(1);
+    let low_h = frame.height.div_ceil(4).max(1);
+    let hdr = float_target(device, frame.width, frame.height, false);
+    let glow = float_target(device, frame.width, frame.height, false);
+    let low = [
+        float_target(device, low_w, low_h, false),
+        float_target(device, low_w, low_h, false),
+    ];
+    let lit = float_target(device, frame.width, frame.height, true);
+    let hdr_view = hdr.create_view(&Default::default());
+    let glow_view = glow.create_view(&Default::default());
+    let low_view = [
+        low[0].create_view(&Default::default()),
+        low[1].create_view(&Default::default()),
+    ];
+    let lit_view = lit.create_view(&Default::default());
+    let draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/draw.wgsl").into()),
+    });
+    let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/bloom.wgsl").into()),
+    });
+    let grid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(draw_layout)],
+        immediate_size: 0,
+    });
+    let grid = hdr_pipeline(device, &draw_shader, &grid_layout);
+    let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[texture_entry(0)],
+    });
+    let tex_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&tex_layout)],
+        immediate_size: 0,
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: None,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let composite_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&composite_layout)],
+            immediate_size: 0,
+        });
+    let float_format = wgpu::TextureFormat::Rgba16Float;
+    BloomTargets {
+        frame,
+        bright_group: texture_group(device, &tex_layout, &glow_view),
+        blur_from: [
+            texture_group(device, &tex_layout, &low_view[0]),
+            texture_group(device, &tex_layout, &low_view[1]),
+        ],
+        composite_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &composite_layout,
+            entries: &[
+                texture_binding(0, &hdr_view),
+                texture_binding(1, &low_view[0]),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        }),
+        blit_group: texture_group(device, &tex_layout, &lit_view),
+        grid,
+        bright: fullscreen_pipeline(device, &bloom_shader, "bright", &tex_pipeline, float_format),
+        blur_x: fullscreen_pipeline(device, &bloom_shader, "blur_x", &tex_pipeline, float_format),
+        blur_y: fullscreen_pipeline(device, &bloom_shader, "blur_y", &tex_pipeline, float_format),
+        composite: fullscreen_pipeline(
+            device,
+            &bloom_shader,
+            "composite",
+            &composite_pipeline_layout,
+            float_format,
+        ),
+        blit: fullscreen_pipeline(device, &bloom_shader, "blit", &tex_pipeline, format),
+        hdr_view,
+        glow_view,
+        low_view,
+        lit_view,
+        hdr,
+        glow,
+        low,
+        sampler,
+        lit,
+    }
+}
+
+fn float_target(device: &wgpu::Device, width: u32, height: u32, copy: bool) -> wgpu::Texture {
+    let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+    if copy {
+        usage |= wgpu::TextureUsages::COPY_SRC;
+    }
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage,
+        view_formats: &[],
+    })
+}
+
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn texture_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[texture_binding(0, view)],
+    })
+}
+
+fn texture_binding(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(view),
+    }
+}
+
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    entry: &str,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn hdr_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let target = wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba16Float,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_hdr"),
+            compilation_options: Default::default(),
+            targets: &[Some(target.clone()), Some(target)],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn viewport(fit: crate::grid::Fit, size: Size) -> Option<(f32, f32, f32, f32)> {
     let x0 = fit.origin_x;
     let y0 = fit.origin_y;
@@ -1071,9 +1460,78 @@ fn viewport(fit: crate::grid::Fit, size: Size) -> Option<(f32, f32, f32, f32)> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn padded_row_bytes(width: u32) -> u32 {
+fn padded_row_bytes(width: u32, bytes_per_pixel: u32) -> u32 {
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    (width * 4).div_ceil(align) * align
+    (width * bytes_per_pixel).div_ceil(align) * align
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stage_copy(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    size: Size,
+    bytes_per_pixel: u32,
+) -> wgpu::Buffer {
+    let stride = padded_row_bytes(size.width, bytes_per_pixel);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: u64::from(stride) * u64::from(size.height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(size.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: size.width,
+            height: size.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    buffer
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn take_pixels(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    size: Size,
+    bytes_per_pixel: u32,
+) -> Vec<u8> {
+    let stride = padded_row_bytes(size.width, bytes_per_pixel);
+    let slice = buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    receiver.recv().expect("map callback").expect("map buffer");
+    let mapped = slice.get_mapped_range().expect("mapped range");
+    let row = (size.width * bytes_per_pixel) as usize;
+    let stride = stride as usize;
+    let mut pixels = Vec::with_capacity(row * size.height as usize);
+    for y in 0..size.height as usize {
+        let start = y * stride;
+        pixels.extend_from_slice(&mapped[start..start + row]);
+    }
+    drop(mapped);
+    buffer.unmap();
+    pixels
 }
 
 #[cfg(test)]
@@ -1678,6 +2136,53 @@ mod tests {
             .iter()
             .filter(|cell| cell.material() == crate::grid::SAND)
             .count()
+    }
+
+    #[test]
+    fn bloom_brightens_the_pixels_next_to_fire() {
+        use crate::grid::{EMPTY, FIRE, SAND, STONE};
+        let mut fire = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        fire.set(8, 8, Cell::pack(FIRE, 0, 255, 0));
+        let size = Size {
+            width: crate::grid::GRID_WIDTH as u32,
+            height: crate::grid::GRID_HEIGHT as u32,
+        };
+        let Some(off) = colours(super::Gpu::render_scene(&fire, size, false)) else {
+            return;
+        };
+        let Some(on) = colours(super::Gpu::render_scene(&fire, size, true)) else {
+            return;
+        };
+        let dark = pixel(&off.rgba, size.width, 9, 8);
+        let lit = pixel(&on.rgba, size.width, 9, 8);
+        assert_eq!(dark, [0, 0, 0, 255]);
+        assert!(lit[0] > dark[0], "neighbour stayed {lit:?}");
+        assert_eq!(pixel(&on.rgba, size.width, 200, 200), [0, 0, 0, 255]);
+        assert_finite(&on.linear);
+        eprintln!("asserted the pixel beside fire rose from {dark:?} to {lit:?}");
+
+        let mut plain = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        plain.set(4, 4, Cell::pack(SAND, 0, 0, 0));
+        plain.set(6, 4, Cell::pack(STONE, 0, 0, 0));
+        let Some(plain_off) = colours(super::Gpu::render_scene(&plain, size, false)) else {
+            return;
+        };
+        let Some(plain_on) = colours(super::Gpu::render_scene(&plain, size, true)) else {
+            return;
+        };
+        assert_eq!(plain_on.rgba, plain_off.rgba);
+        assert_finite(&plain_on.linear);
+        eprintln!("asserted a scene without emissive pixels was unchanged");
+    }
+
+    fn assert_finite(linear: &[u8]) {
+        let (texels, rest) = linear.as_chunks::<2>();
+        assert!(rest.is_empty());
+        for (index, bytes) in texels.iter().enumerate() {
+            let bits = u16::from_le_bytes(*bytes);
+            let exponent = (bits >> 10) & 0x1f;
+            assert_ne!(exponent, 0x1f, "non-finite texel {index}");
+        }
     }
 
     #[test]

@@ -20,6 +20,10 @@ struct MaterialInfo {
     life: u32,
     becomes: u32,
     colour: vec4<f32>,
+    emissive: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct Reaction {

@@ -11,13 +11,13 @@ mise install
 cargo run
 ```
 
-The window title is grains. The inner size is 1024 by 600 physical pixels. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Wood next to fire burns. Fire rises a little and leaves smoke. Water puts fire out and becomes steam, and steam rises until it condenses.
+The window title is grains. The inner size is 1024 by 600 physical pixels. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Wood next to fire burns. Fire rises a little, glows, and leaves smoke. Water puts fire out and becomes steam, and steam rises until it condenses.
 
 ## Controls
 
 Left click paints. Right click erases. The scroll wheel changes the radius. The terminal prints the material and the radius when either changes.
 
-Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, or `9` for steam. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
+Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, or `9` for steam. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
 
 ## Build the web page
 
@@ -38,6 +38,5 @@ GitHub Pages deploys from `main` only after the repo's Pages source is set to Gi
 
 ## Roadmap
 
-7. A colourize pass that replaces the debug colours with a palette.
-8. Bloom: bright pass, separable blur, composite.
+8. A colourize pass that replaces the debug colours with a palette.
 9. An egui overlay for the material picker.
