@@ -224,28 +224,13 @@ impl Gpu {
         self.reconfigure();
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        window: &Window,
-        grid: &Grid,
-        paint: Paint,
-        ui: Option<EguiFrame>,
-    ) {
+    pub(crate) fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
         if self.size.width == 0 || self.size.height == 0 {
-            return;
+            return None;
         }
-        let current = {
-            let Some(surface) = self.surface.as_ref() else {
-                return;
-            };
-            surface.surface.get_current_texture()
-        };
+        let current = self.surface.as_ref()?.surface.get_current_texture();
         match current {
-            wgpu::CurrentSurfaceTexture::Success(frame) => {
-                self.paint(&frame.texture, grid, &paint, ui);
-                window.pre_present_notify();
-                self.queue.present(frame);
-            }
+            wgpu::CurrentSurfaceTexture::Success(frame) => return Some(frame),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 drop(frame);
                 self.reconfigure();
@@ -255,6 +240,20 @@ impl Gpu {
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
             wgpu::CurrentSurfaceTexture::Validation => panic!("surface validation"),
         }
+        None
+    }
+
+    pub(crate) fn draw(
+        &mut self,
+        frame: wgpu::SurfaceTexture,
+        window: &Window,
+        grid: &Grid,
+        paint: Paint,
+        ui: Option<EguiFrame>,
+    ) {
+        self.paint(&frame.texture, grid, &paint, ui);
+        window.pre_present_notify();
+        self.queue.present(frame);
     }
 
     async fn open(
@@ -265,11 +264,13 @@ impl Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends();
         let instance = wgpu::Instance::new(descriptor);
-        let surface = window.as_ref().map(|window| {
-            instance
-                .create_surface(Arc::clone(window))
-                .expect("surface")
-        });
+        let surface = window
+            .as_ref()
+            .map(|window| instance.create_surface(Arc::clone(window)))
+            .transpose()
+            .map_err(|err| NoAdapter {
+                names: vec![err.to_string()],
+            })?;
         let adapters = instance.enumerate_adapters(backends()).await;
         let mut names = Vec::new();
         let mut opened = None;
@@ -465,7 +466,8 @@ impl Gpu {
         bloom: bool,
         ui: Option<EguiFrame>,
     ) {
-        if let Some(ui) = &ui {
+        let mut ui = ui;
+        if let Some(ui) = &mut ui {
             let mut uploads = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -476,8 +478,8 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.draw_bloom(&mut encoder, texture, index, bloom);
-        if let Some(ui) = ui {
-            self.paint_egui(&mut encoder, texture, &ui);
+        if let Some(ui) = &mut ui {
+            self.paint_egui(&mut encoder, texture, ui);
         }
         #[cfg(target_arch = "wasm32")]
         let probe = self.record_probe(&mut encoder, texture);
@@ -507,7 +509,10 @@ impl Gpu {
             (748, 348, "stroke"),
         ];
         let mut buffers = Vec::new();
+        let scale = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
         for (x, y, name) in spots {
+            let x = ((f64::from(x) * scale).round() as u32).min(self.size.width - 1);
+            let y = ((f64::from(y) * scale).round() as u32).min(self.size.height - 1);
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("probe"),
                 size: 256,
@@ -580,7 +585,7 @@ impl Gpu {
         }
     }
 
-    fn prepare_egui(&mut self, encoder: &mut wgpu::CommandEncoder, ui: &EguiFrame) {
+    fn prepare_egui(&mut self, encoder: &mut wgpu::CommandEncoder, ui: &mut EguiFrame) {
         if self.egui.is_none() {
             self.egui = Some(egui_wgpu::Renderer::new(
                 &self.device,
@@ -592,9 +597,9 @@ impl Gpu {
         let queue = self.queue.clone();
         let screen = self.egui_screen(ui);
         let renderer = self.egui.as_mut().unwrap();
-        for (id, images) in &ui.textures.set {
+        for (id, images) in ui.textures.set.drain() {
             for image in images {
-                renderer.update_texture(&device, &queue, *id, image);
+                renderer.update_texture(&device, &queue, id, &image);
             }
         }
         let _ = renderer.update_buffers(&device, &queue, encoder, &ui.primitives, &screen);
@@ -604,7 +609,7 @@ impl Gpu {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         texture: &wgpu::Texture,
-        ui: &EguiFrame,
+        ui: &mut EguiFrame,
     ) {
         let screen = self.egui_screen(ui);
         // Solid rects in the panel sample egui's font atlas at uv 0. On web that
@@ -636,12 +641,12 @@ impl Gpu {
             renderer.render(&mut pass, &ui.primitives, &screen);
             drop(pass);
         }
-        for id in &ui.textures.free {
-            renderer.free_texture(id);
+        for id in ui.textures.free.drain() {
+            renderer.free_texture(&id);
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", test))]
     fn draw_widget_colors(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -651,12 +656,38 @@ impl Gpu {
         let mut vertices: Vec<u8> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut base = 0u32;
+        let mut batches = Vec::new();
+        let scale = self.egui_screen(ui).pixels_per_point;
         for prim in &ui.primitives {
             let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive else {
                 continue;
             };
+            let clip = prim.clip_rect;
+            let x0 = ((clip.min.x * scale).round() as u32).min(self.size.width);
+            let y0 = ((clip.min.y * scale).round() as u32).min(self.size.height);
+            let x1 = ((clip.max.x * scale).round() as u32).min(self.size.width);
+            let y1 = ((clip.max.y * scale).round() as u32).min(self.size.height);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let first = indices.len() as u32;
             vertices.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
-            indices.extend(mesh.indices.iter().map(|index| index + base));
+            // Only underpaint solid shapes. Glyph quads need the atlas alpha
+            // mask or their transparent pixels become solid rectangles.
+            if mesh.texture_id == egui::TextureId::Managed(0) {
+                for tri in mesh.indices.as_chunks::<3>().0 {
+                    if tri
+                        .iter()
+                        .all(|&i| mesh.vertices[i as usize].uv == egui::epaint::WHITE_UV)
+                    {
+                        indices.extend(tri.iter().map(|index| index + base));
+                    }
+                }
+            }
+            let end = indices.len() as u32;
+            if end > first {
+                batches.push((first..end, [x0, y0, x1 - x0, y1 - y0]));
+            }
             base += mesh.vertices.len() as u32;
         }
         if indices.is_empty() {
@@ -669,7 +700,12 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let screen = [self.size.width as f32, self.size.height as f32, 0.0, 0.0];
+        let screen = [
+            self.size.width as f32 / scale,
+            self.size.height as f32 / scale,
+            0.0,
+            0.0,
+        ];
         self.queue
             .write_buffer(&uniform, 0, bytemuck::cast_slice(&screen));
         let layout = pipeline.get_bind_group_layout(0);
@@ -717,7 +753,10 @@ impl Gpu {
         pass.set_bind_group(0, &group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        for (indices, [x, y, width, height]) in batches {
+            pass.set_scissor_rect(x, y, width, height);
+            pass.draw_indexed(indices, 0, 0..1);
+        }
     }
 
     fn egui_screen(&self, ui: &EguiFrame) -> egui_wgpu::ScreenDescriptor {
@@ -1982,7 +2021,7 @@ fn letterbox_color() -> wgpu::Color {
 #[cfg(target_arch = "wasm32")]
 static PROBE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn widget_color_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -2885,6 +2924,75 @@ mod tests {
             gpu.step(pass % 2);
         }
         Some(gpu)
+    }
+
+    #[test]
+    fn solid_widgets_follow_point_scale_and_clip_rect() {
+        let size = Size {
+            width: 64,
+            height: 64,
+        };
+        let grid = crate::grid::Grid::filled(64, 64, |_, _| Cell::pack(0, 0, 0, 0));
+        let Some(gpu) = open_world(&grid, 0, false) else {
+            return;
+        };
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: gpu.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut mesh = egui::Mesh::default();
+        mesh.add_colored_rect(
+            egui::Rect::from_min_max(egui::pos2(4., 4.), egui::pos2(20., 20.)),
+            egui::Color32::WHITE,
+        );
+        let ui = super::EguiFrame {
+            primitives: vec![egui::ClippedPrimitive {
+                clip_rect: egui::Rect::from_min_max(egui::pos2(8., 8.), egui::pos2(16., 16.)),
+                primitive: egui::epaint::Primitive::Mesh(mesh),
+            }],
+            textures: Default::default(),
+            pixels_per_point: 2.,
+        };
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.draw_widget_colors(&mut encoder, &texture, &ui);
+        let buffer = super::stage_copy(&gpu.device, &mut encoder, &texture, size, 4);
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = super::take_pixels(&gpu.device, &buffer, size, 4);
+        assert_eq!(pixel(&pixels, 64, 24, 24), [255; 4], "widget point scale");
+        assert_eq!(pixel(&pixels, 64, 12, 12), [0; 4], "widget clip");
+        assert_eq!(pixel(&pixels, 64, 32, 32), [0; 4], "exclusive clip maximum");
+    }
+
+    #[test]
+    fn first_panel_frame_consumes_font_upload() {
+        let grid = crate::grid::Grid::filled(64, 64, |_, _| Cell::pack(0, 0, 0, 0));
+        let Some(mut gpu) = open_world(&grid, 0, false) else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run_pass(Default::default(), |ctx| {
+            egui::Window::new("grains").show(ctx, |ui| ui.label("sand"));
+        });
+        let mut ui = super::EguiFrame {
+            primitives: ctx.tessellate(output.shapes, output.pixels_per_point),
+            textures: output.textures_delta,
+            pixels_per_point: output.pixels_per_point,
+        };
+        assert!(!ui.textures.set.is_empty());
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.prepare_egui(&mut encoder, &mut ui);
+        gpu.queue.submit([encoder.finish()]);
+        drop(ui); // egui checks that the renderer consumed the upload.
     }
 
     fn run_world(grid: &crate::grid::Grid, passes: u32, chunked: bool) -> Option<Vec<Cell>> {

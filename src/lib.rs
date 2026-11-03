@@ -327,6 +327,16 @@ impl App {
     }
 
     fn redraw(&mut self, window: &Window) {
+        // Only run egui when its texture updates have a frame to render into.
+        let frame = {
+            let mut slot = self.gpu.borrow_mut();
+            let Some(gpu) = slot.as_mut() else { return };
+            let Some(frame) = gpu.acquire_frame() else {
+                window.request_redraw();
+                return;
+            };
+            frame
+        };
         let now = web_time::Instant::now();
         let dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -386,6 +396,7 @@ impl App {
         if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
             gpu.set_camera(self.camera);
             gpu.draw(
+                frame,
                 window,
                 &self.grid,
                 Paint {
