@@ -1372,6 +1372,81 @@ mod tests {
     }
 
     #[test]
+    fn a_falling_water_column_stays_narrow() {
+        use crate::grid::{EMPTY, OIL, WATER};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for y in 10..22 {
+            grid.set(20, y, Cell::pack(WATER, 0, 0, 0));
+            grid.set(21, y, Cell::pack(WATER, 0, 0, 0));
+            grid.set(40, y, Cell::pack(OIL, 0, 0, 0));
+            grid.set(41, y, Cell::pack(OIL, 0, 0, 0));
+        }
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 8)) else {
+            return;
+        };
+        assert_narrow(&cells, WATER, 20, 21);
+        assert_narrow(&cells, OIL, 40, 41);
+        let water_bottom = (0..crate::grid::GRID_HEIGHT)
+            .rev()
+            .find(|y| material_at(&cells, 20, *y) == WATER || material_at(&cells, 21, *y) == WATER)
+            .unwrap();
+        let oil_bottom = (0..crate::grid::GRID_HEIGHT)
+            .rev()
+            .find(|y| material_at(&cells, 40, *y) == OIL || material_at(&cells, 41, *y) == OIL)
+            .unwrap();
+        assert!(
+            water_bottom > 21,
+            "water did not fall, bottom {water_bottom}"
+        );
+        assert!(oil_bottom > 21, "oil did not fall, bottom {oil_bottom}");
+        eprintln!("asserted falling water and oil stayed in a column");
+    }
+
+    fn assert_narrow(cells: &[Cell], material: u8, x0: usize, x1: usize) {
+        let mut seen = 0usize;
+        for y in 0..crate::grid::GRID_HEIGHT {
+            for x in 0..crate::grid::GRID_WIDTH {
+                if material_at(cells, x, y) != material {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    (x0..=x1).contains(&x),
+                    "{material} sprayed to x={x} from {x0}..={x1}"
+                );
+            }
+        }
+        assert_eq!(seen, 24, "lost {material}");
+    }
+
+    #[test]
+    fn smoke_rises_slower_than_sand_falls() {
+        use crate::grid::{EMPTY, SAND, SMOKE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(8, 30, Cell::pack(SAND, 0, 0, 0));
+        grid.set(12, 30, Cell::pack(SMOKE, 0, 40, 0));
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 8)) else {
+            return;
+        };
+        let sand_y = (0..crate::grid::GRID_HEIGHT)
+            .filter(|y| material_at(&cells, 8, *y) == SAND)
+            .max()
+            .unwrap();
+        let smoke_y = (0..crate::grid::GRID_HEIGHT)
+            .filter(|y| (0..crate::grid::GRID_WIDTH).any(|x| material_at(&cells, x, *y) == SMOKE))
+            .min()
+            .unwrap();
+        let sand_drop = sand_y - 30;
+        let smoke_rise = 30 - smoke_y;
+        assert!(
+            sand_drop > smoke_rise,
+            "sand {sand_drop} smoke {smoke_rise}"
+        );
+        assert!(smoke_rise >= 1, "smoke did not rise");
+        eprintln!("asserted sand fell {sand_drop} and smoke rose {smoke_rise}");
+    }
+
+    #[test]
     fn smoke_rises_and_then_disappears() {
         use crate::grid::{EMPTY, SMOKE};
         let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
