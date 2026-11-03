@@ -1,0 +1,49 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned toolchain
+        id: rust
+        shell: bash
+        run: |
+          mise_rust=$(sed -n 's/^rust *= *"\(.*\)"/\1/p' mise.toml)
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          if [ "$mise_rust" != "$channel" ] || [ -z "$channel" ]; then
+            echo "mise.toml has ${mise_rust} and rust-toolchain.toml has ${channel}"
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - name: Build the wasm library
+        run: cargo build --release --lib --locked --target wasm32-unknown-unknown
+      - name: Package the page
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+          wasm-bindgen --target web --out-dir dist target/wasm32-unknown-unknown/release/grains.wasm
+          cp web/index.html dist/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

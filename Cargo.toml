@@ -1,0 +1,27 @@
+[package]
+name = "grains"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "grains"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+bytemuck = { version = "1.25", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = "30"
+pollster = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["webgpu", "wgsl"] }
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlCanvasElement", "Window"] }
+console_error_panic_hook = "0.1"

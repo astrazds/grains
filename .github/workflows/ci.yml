@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned toolchain
+        id: rust
+        shell: bash
+        run: |
+          mise_rust=$(sed -n 's/^rust *= *"\(.*\)"/\1/p' mise.toml)
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          if [ "$mise_rust" != "$channel" ] || [ -z "$channel" ]; then
+            echo "mise.toml has ${mise_rust} and rust-toolchain.toml has ${channel}"
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - name: Wasm
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy --target wasm32-unknown-unknown --lib --locked -- -D warnings
+          cargo build --lib --locked --target wasm32-unknown-unknown
