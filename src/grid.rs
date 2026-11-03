@@ -375,14 +375,16 @@ pub fn physical_pixel(css: f64, ratio: f64) -> i32 {
 }
 
 pub fn letterbox(size: Size) -> Option<Fit> {
+    letterbox_world(size, GRID_WIDTH as u32, GRID_HEIGHT as u32)
+}
+
+pub(crate) fn letterbox_world(size: Size, width: u32, height: u32) -> Option<Fit> {
     if size.width == 0 || size.height == 0 {
         return None;
     }
-    let scale = (size.width / GRID_WIDTH as u32)
-        .min(size.height / GRID_HEIGHT as u32)
-        .max(1);
-    let span_x = GRID_WIDTH as i32 * scale as i32;
-    let span_y = GRID_HEIGHT as i32 * scale as i32;
+    let scale = (size.width / width).min(size.height / height).max(1);
+    let span_x = width as i32 * scale as i32;
+    let span_y = height as i32 * scale as i32;
     Some(Fit {
         scale,
         origin_x: (size.width as i32 - span_x) / 2,
@@ -397,18 +399,8 @@ pub struct Grid {
 }
 
 impl Grid {
-    pub fn from_fn(mut each: impl FnMut(usize, usize) -> Cell) -> Self {
-        let mut cells = vec![Cell::pack(0, 0, 0, 0); CELL_COUNT];
-        for y in 0..GRID_HEIGHT {
-            for x in 0..GRID_WIDTH {
-                cells[index(x, y)] = each(x, y);
-            }
-        }
-        Self {
-            width: GRID_WIDTH,
-            height: GRID_HEIGHT,
-            cells: cells.into_boxed_slice(),
-        }
+    pub fn from_fn(each: impl FnMut(usize, usize) -> Cell) -> Self {
+        Self::filled(GRID_WIDTH, GRID_HEIGHT, each)
     }
 
     pub fn filled(width: usize, height: usize, mut each: impl FnMut(usize, usize) -> Cell) -> Self {
@@ -456,13 +448,13 @@ impl Grid {
     }
 
     pub fn place(&mut self, width: u32, height: u32, words: &[u32]) -> Result<(), String> {
-        if words.len() != width as usize * height as usize {
-            return Err("this world has the wrong number of cells".to_string());
-        }
         if width as usize > self.width || height as usize > self.height {
             return Err(format!(
                 "this world is {width} by {height}, which is larger than grains can load"
             ));
+        }
+        if words.len() != width as usize * height as usize {
+            return Err("this world has the wrong number of cells".to_string());
         }
         for cell in self.cells.iter_mut() {
             *cell = Cell::pack(EMPTY, 0, 0, 0);
@@ -495,11 +487,20 @@ impl Grid {
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Cell {
-        self.cells[y * self.width + x]
+        self.cells[self.index(x, y)]
     }
 
     pub fn set(&mut self, x: usize, y: usize, cell: Cell) {
-        self.cells[y * self.width + x] = cell;
+        let index = self.index(x, y);
+        self.cells[index] = cell;
+    }
+
+    fn index(&self, x: usize, y: usize) -> usize {
+        assert!(
+            x < self.width && y < self.height,
+            "{x},{y} outside the grid"
+        );
+        y * self.width + x
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -517,14 +518,6 @@ impl Grid {
             cells: cells.into_boxed_slice(),
         })
     }
-}
-
-fn index(x: usize, y: usize) -> usize {
-    assert!(
-        x < GRID_WIDTH && y < GRID_HEIGHT,
-        "{x},{y} outside the grid"
-    );
-    y * GRID_WIDTH + x
 }
 
 fn ledge(x: usize, y: usize) -> bool {
@@ -643,6 +636,13 @@ mod tests {
             Some((11, 4))
         );
         assert_eq!(super::cell_at_camera(300.0, 0.0, camera, 128, 128), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn column_past_the_grid_does_not_alias_the_next_row() {
+        let mut grid = super::Grid::filled(4, 2, |_, _| Cell::pack(0, 0, 0, 0));
+        grid.set(4, 0, Cell::pack(super::STONE, 0, 0, 0));
     }
 
     #[test]

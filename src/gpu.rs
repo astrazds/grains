@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
 use crate::grid::{GRID_HEIGHT, GRID_WIDTH};
-use crate::grid::{Grid, LETTERBOX, Size, letterbox};
+use crate::grid::{Grid, LETTERBOX, Size, letterbox_world};
 
 #[derive(Debug)]
 pub struct NoAdapter {
@@ -203,11 +203,13 @@ impl Gpu {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut gpu = pollster::block_on(Self::open(
-                None,
-                size,
-                (GRID_WIDTH as u32, GRID_HEIGHT as u32),
-            ))?;
+            // Empty grids still need a valid, zero-initialized storage binding for the sky.
+            let world = if grid.as_bytes().is_empty() {
+                (1, 1)
+            } else {
+                (grid.width() as u32, grid.height() as u32)
+            };
+            let mut gpu = pollster::block_on(Self::open(None, size, world))?;
             Ok(gpu.read_scene(grid, size, bloom))
         }
         #[cfg(target_arch = "wasm32")]
@@ -1353,7 +1355,7 @@ impl Gpu {
         let (cell_x, cell_y, zoom) = if let Some(camera) = self.camera {
             (camera.cell_x, camera.cell_y, camera.zoom)
         } else {
-            let fit = letterbox(size)?;
+            let fit = letterbox_world(size, self.world_w, self.world_h)?;
             let zoom = fit.scale as f32;
             (
                 -(fit.origin_x as f32) / zoom,
@@ -2494,6 +2496,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn offscreen_letterboxes_the_actual_world_dimensions() {
+        let grid = crate::grid::Grid::filled(3, 2, |x, y| Cell::pack(10 + x as u8, y as u8, 0, 0));
+        let size = Size {
+            width: 8,
+            height: 4,
+        };
+        let Some(frame) = colours(crate::render_rgba(&grid, size)) else {
+            return;
+        };
+        assert_eq!(pixel(&frame, 8, 1, 0), [10, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 8, 6, 3), [12, 1, 0, 255]);
+        assert_ne!(pixel(&frame, 8, 0, 0), [10, 0, 0, 255]);
+    }
     #[test]
     fn offscreen_pixels() {
         let grid = crate::grid::Grid::from_fn(|x, y| match (x, y) {
