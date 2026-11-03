@@ -33,6 +33,9 @@ pub struct Controls {
     pub paused: bool,
     pub bloom: bool,
     pub clear: bool,
+    pub save: bool,
+    pub load: bool,
+    pub share: bool,
 }
 
 impl Controls {
@@ -44,6 +47,9 @@ impl Controls {
             paused: false,
             bloom: true,
             clear: false,
+            save: false,
+            load: false,
+            share: false,
         }
     }
 }
@@ -78,16 +84,22 @@ fn key_for(id: u8) -> Option<char> {
         .map(|(key, _)| *key)
 }
 
-pub fn show(ctx: &egui::Context, controls: &mut Controls, fps: f32) {
+pub fn show(ctx: &egui::Context, controls: &mut Controls, fps: f32, notice: &str) {
     egui::Window::new("grains")
         .default_pos([12.0, 12.0])
         .resizable(false)
         .show(ctx, |ui| {
-            panel(ui, controls, fps);
+            panel(ui, controls, fps, notice);
         });
 }
 
-fn panel(ui: &mut egui::Ui, controls: &mut Controls, fps: f32) -> Vec<(u8, egui::Rect)> {
+#[cfg_attr(not(test), allow(dead_code))]
+struct LaidOut {
+    swatches: Vec<(u8, egui::Rect)>,
+    save: egui::Rect,
+}
+
+fn panel(ui: &mut egui::Ui, controls: &mut Controls, fps: f32, notice: &str) -> LaidOut {
     if fps > 0.0 {
         ui.label(format!("{fps:.0} fps"));
     } else {
@@ -105,7 +117,23 @@ fn panel(ui: &mut egui::Ui, controls: &mut Controls, fps: f32) -> Vec<(u8, egui:
     if ui.button("clear").clicked() {
         controls.clear = true;
     }
-    rects
+    let save = ui.button("save");
+    if save.clicked() {
+        controls.save = true;
+    }
+    if ui.button("load").clicked() {
+        controls.load = true;
+    }
+    if ui.button("copy link").clicked() {
+        controls.share = true;
+    }
+    if !notice.is_empty() {
+        ui.label(notice);
+    }
+    LaidOut {
+        swatches: rects,
+        save: save.rect,
+    }
 }
 
 fn swatch(ui: &mut egui::Ui, controls: &mut Controls, row: &Swatch) -> egui::Rect {
@@ -170,7 +198,7 @@ mod tests {
         let mut wood = None;
         let output = ctx.run_pass(input(screen, &[]), |ctx| {
             ctx.root_ui(|ui| {
-                for (id, rect) in panel(ui, &mut controls, 60.0) {
+                for (id, rect) in panel(ui, &mut controls, 60.0, "").swatches {
                     if id == WOOD {
                         wood = Some(rect);
                     }
@@ -183,6 +211,25 @@ mod tests {
         click(&ctx, screen, pos, true, &mut controls);
         click(&ctx, screen, pos, false, &mut controls);
         assert_eq!(controls.material, WOOD);
+    }
+
+    #[test]
+    fn clicking_save_asks_to_save() {
+        let ctx = egui::Context::default();
+        let mut controls = Controls::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 640.0));
+        let mut save = None;
+        let output = ctx.run_pass(input(screen, &[]), |ctx| {
+            ctx.root_ui(|ui| {
+                save = Some(panel(ui, &mut controls, 60.0, "").save);
+            });
+        });
+        output.drop_without_applying_deltas();
+        let pos = save.expect("save button").center();
+        click(&ctx, screen, pos, true, &mut controls);
+        click(&ctx, screen, pos, false, &mut controls);
+        assert!(controls.save);
+        assert!(!controls.load);
     }
 
     fn click(
@@ -203,7 +250,7 @@ mod tests {
         ];
         let output = ctx.run_pass(input(screen, &events), |ctx| {
             ctx.root_ui(|ui| {
-                panel(ui, controls, 60.0);
+                panel(ui, controls, 60.0, "");
             });
         });
         output.drop_without_applying_deltas();

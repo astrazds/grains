@@ -856,6 +856,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "js-sys",
  "pollster",
  "wasm-bindgen",
  "wasm-bindgen-futures",

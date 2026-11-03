@@ -1,6 +1,7 @@
 mod gpu;
 mod grid;
 mod ui;
+mod world;
 
 #[cfg(target_arch = "wasm32")]
 mod web;
@@ -15,6 +16,7 @@ pub fn render_rgba(grid: &Grid, size: Size) -> Result<Vec<u8>, NoAdapter> {
     Gpu::render_rgba(grid, size)
 }
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -26,6 +28,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use gpu::{EguiFrame, Gpu, Paint, Stroke};
+
+type Inbox = Rc<RefCell<Option<Result<Vec<u8>, String>>>>;
 use grid::material_name;
 use ui::{Controls, PASSES_MAX, RADIUS_MAX};
 
@@ -42,6 +46,9 @@ struct App {
     erasing: bool,
     cursor: Option<(f64, f64)>,
     last_cell: Option<(i32, i32)>,
+    notice: Rc<RefCell<String>>,
+    inbox: Inbox,
+    link_checked: bool,
 }
 
 pub fn run() {
@@ -62,6 +69,9 @@ pub fn run() {
         erasing: false,
         cursor: None,
         last_cell: None,
+        notice: Rc::new(RefCell::new(String::new())),
+        inbox: Rc::new(RefCell::new(None)),
+        link_checked: false,
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -241,6 +251,8 @@ impl App {
                 eprintln!("passes {}", self.controls.passes);
             }
             KeyCode::KeyC => self.controls.clear = true,
+            KeyCode::KeyS => self.controls.save = true,
+            KeyCode::KeyL => self.controls.load = true,
             KeyCode::KeyB => {
                 self.controls.bloom = !self.controls.bloom;
                 if self.controls.bloom {
@@ -293,7 +305,21 @@ impl App {
             self.controls.paused,
             self.controls.bloom,
         );
+        self.take_inbox();
+        self.open_link();
         let ui = self.run_panel(window);
+        if self.controls.save {
+            self.controls.save = false;
+            self.save_world();
+        }
+        if self.controls.load {
+            self.controls.load = false;
+            self.load_world();
+        }
+        if self.controls.share {
+            self.controls.share = false;
+            self.share_world();
+        }
         if self.controls.material != before.0 || self.controls.radius != before.1 {
             self.log_brush();
         }
@@ -341,7 +367,8 @@ impl App {
         };
         let fps = self.fps;
         let full = ctx.run_pass(input, |ctx| {
-            ui::show(ctx, &mut self.controls, fps);
+            let notice = self.notice.borrow().clone();
+            ui::show(ctx, &mut self.controls, fps, &notice);
             self.over_panel = ctx.is_pointer_over_egui();
         });
         let ui = self.egui.as_mut()?;
@@ -352,6 +379,135 @@ impl App {
             textures: full.textures_delta,
             pixels_per_point: full.pixels_per_point,
         })
+    }
+
+    fn take_inbox(&mut self) {
+        let Some(result) = self.inbox.borrow_mut().take() else {
+            return;
+        };
+        match result {
+            Ok(bytes) => self.apply_file(&bytes),
+            Err(err) => self.set_notice(err),
+        }
+    }
+
+    fn open_link(&mut self) {
+        if self.link_checked {
+            return;
+        }
+        self.link_checked = true;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let hash = web::hash();
+            if hash.trim_start_matches('#').is_empty() {
+                return;
+            }
+            match world::bytes_from_hash(&hash) {
+                Ok(bytes) => self.apply_file(&bytes),
+                Err(err) => self.set_notice(err),
+            }
+        }
+    }
+
+    fn save_world(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let words = match self.snapshot() {
+                Ok(words) => words,
+                Err(err) => {
+                    self.set_notice(err);
+                    return;
+                }
+            };
+            self.set_notice(write_file(&words));
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.with_grid(
+            |words| match words.and_then(|words| world::encode(&words)) {
+                Ok(bytes) => match web::download(&bytes) {
+                    Ok(()) => format!("saved {}", world::FILE_NAME),
+                    Err(err) => err,
+                },
+                Err(err) => err,
+            },
+        );
+    }
+
+    fn load_world(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        match std::fs::read(world::FILE_NAME) {
+            Ok(bytes) => self.apply_file(&bytes),
+            Err(err) => self.set_notice(format!("could not load {}: {err}", world::FILE_NAME)),
+        }
+        #[cfg(target_arch = "wasm32")]
+        web::pick_file(Rc::clone(&self.inbox));
+    }
+
+    fn share_world(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let words = match self.snapshot() {
+                Ok(words) => words,
+                Err(err) => {
+                    self.set_notice(err);
+                    return;
+                }
+            };
+            self.set_notice(native_link(&words));
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.with_grid(
+            |words| match words.and_then(|words| world::encode(&words)) {
+                Ok(bytes) => match world::hash_fragment(&bytes) {
+                    Ok(fragment) => match web::set_hash(&fragment) {
+                        Ok(()) => "updated the link".to_string(),
+                        Err(err) => err,
+                    },
+                    Err(err) => err,
+                },
+                Err(err) => err,
+            },
+        );
+    }
+
+    fn apply_file(&mut self, bytes: &[u8]) {
+        match world::decode(bytes).and_then(|words| grid::Grid::from_words(&words)) {
+            Ok(grid) => {
+                if let Some(gpu) = self.gpu.borrow_mut().as_mut() {
+                    gpu.store(&grid);
+                }
+                self.grid = grid;
+                self.set_notice("loaded the world");
+            }
+            Err(err) => self.set_notice(err),
+        }
+    }
+
+    fn set_notice(&self, text: impl Into<String>) {
+        *self.notice.borrow_mut() = text.into();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn snapshot(&self) -> Result<Vec<u32>, String> {
+        let gpu = self.gpu.borrow();
+        let Some(gpu) = gpu.as_ref() else {
+            return Err("the grid is not ready to save".to_string());
+        };
+        Ok(gpu.snapshot())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn with_grid(&self, done: impl FnOnce(Result<Vec<u32>, String>) -> String + 'static) {
+        let notice = Rc::clone(&self.notice);
+        let gpu = self.gpu.borrow();
+        let Some(gpu) = gpu.as_ref() else {
+            drop(gpu);
+            self.set_notice("the grid is not ready to save");
+            return;
+        };
+        gpu.snapshot_then(move |words| {
+            *notice.borrow_mut() = done(words);
+        });
     }
 
     fn stroke_for(&mut self, window: &Window) -> Option<Stroke> {
@@ -379,5 +535,27 @@ impl App {
             erase: u32::from(self.erasing),
             clear: 0,
         })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_file(words: &[u32]) -> String {
+    match world::encode(words) {
+        Ok(bytes) => match std::fs::write(world::FILE_NAME, bytes) {
+            Ok(()) => format!("saved {}", world::FILE_NAME),
+            Err(err) => format!("could not save {}: {err}", world::FILE_NAME),
+        },
+        Err(err) => err,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_link(words: &[u32]) -> String {
+    match world::encode(words).and_then(|bytes| world::hash_fragment(&bytes)) {
+        Ok(fragment) => {
+            eprintln!("link #{fragment}");
+            "printed a link for this world".to_string()
+        }
+        Err(err) => err,
     }
 }
