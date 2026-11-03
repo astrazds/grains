@@ -33,7 +33,7 @@ pub fn run() {
     let app = App {
         window: None,
         gpu: Rc::new(std::cell::RefCell::new(None)),
-        grid: Grid::random(),
+        grid: Grid::demo(),
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
