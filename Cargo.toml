@@ -7,5 +7,14 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "grains"
+path = "src/main.rs"
+
 [dependencies]
+winit = "0.30"
 bytemuck = { version = "1.25", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = "30"
+pollster = "0.4"
