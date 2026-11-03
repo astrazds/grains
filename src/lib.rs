@@ -25,9 +25,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use gpu::{Gpu, Paint, Stroke};
-use grid::{EMPTY, SAND, STONE};
+use grid::{EMPTY, OIL, SAND, SMOKE, STONE, WATER, material_name, spawn_word};
 
 const RADIUS_MAX: i32 = 48;
+const PASSES_MAX: u32 = 16;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -35,6 +36,7 @@ struct App {
     grid: Grid,
     material: u8,
     radius: i32,
+    passes: u32,
     painting: bool,
     erasing: bool,
     paused: bool,
@@ -45,6 +47,7 @@ struct App {
 
 pub fn run() {
     eprintln!("brush sand radius 2");
+    eprintln!("passes 4");
     let event_loop = EventLoop::new().expect("event loop");
     let app = App {
         window: None,
@@ -52,6 +55,7 @@ pub fn run() {
         grid: Grid::demo(),
         material: SAND,
         radius: 2,
+        passes: 4,
         painting: false,
         erasing: false,
         paused: false,
@@ -153,6 +157,7 @@ impl ApplicationHandler for App {
                         Paint {
                             paused: self.paused,
                             clear,
+                            passes: self.passes,
                             stroke,
                         },
                     );
@@ -193,6 +198,18 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Digit1) => self.set_material(EMPTY),
                     PhysicalKey::Code(KeyCode::Digit2) => self.set_material(STONE),
                     PhysicalKey::Code(KeyCode::Digit3) => self.set_material(SAND),
+                    PhysicalKey::Code(KeyCode::Digit4) => self.set_material(WATER),
+                    PhysicalKey::Code(KeyCode::Digit5) => self.set_material(OIL),
+                    PhysicalKey::Code(KeyCode::Digit6) => self.set_material(SMOKE),
+                    PhysicalKey::Code(KeyCode::Minus)
+                    | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
+                        self.passes = self.passes.saturating_sub(1).max(1);
+                        eprintln!("passes {}", self.passes);
+                    }
+                    PhysicalKey::Code(KeyCode::Equal) | PhysicalKey::Code(KeyCode::NumpadAdd) => {
+                        self.passes = (self.passes + 1).min(PASSES_MAX);
+                        eprintln!("passes {}", self.passes);
+                    }
                     PhysicalKey::Code(KeyCode::KeyC) => self.clear = true,
                     PhysicalKey::Code(KeyCode::Space) => {
                         self.paused = !self.paused;
@@ -217,13 +234,11 @@ impl App {
     }
 
     fn log_brush(&self) {
-        let name = match self.material {
-            EMPTY => "empty",
-            STONE => "stone",
-            SAND => "sand",
-            _ => "other",
-        };
-        eprintln!("brush {name} radius {}", self.radius);
+        eprintln!(
+            "brush {} radius {}",
+            material_name(self.material),
+            self.radius
+        );
     }
 
     fn stroke_for(&mut self, window: &Window) -> Option<Stroke> {
@@ -247,7 +262,7 @@ impl App {
             to_x: cell.0,
             to_y: cell.1,
             radius: self.radius as u32,
-            material: u32::from(self.material),
+            material: spawn_word(self.material),
             erase: u32::from(self.erasing),
             clear: 0,
         })

@@ -5,8 +5,6 @@ use winit::window::Window;
 
 use crate::grid::{CELL_COUNT, GRID_HEIGHT, GRID_WIDTH, Grid, LETTERBOX, Size, letterbox};
 
-const PASSES_PER_FRAME: u32 = 4;
-
 #[derive(Debug)]
 pub struct NoAdapter {
     names: Vec<String>,
@@ -38,6 +36,9 @@ pub(crate) struct Gpu {
     brush_uniform: wgpu::Buffer,
     brush_groups: [wgpu::BindGroup; 2],
     brush_pipeline: wgpu::ComputePipeline,
+    // Bind groups borrow this buffer. The field keeps it alive.
+    #[allow(dead_code)]
+    materials: wgpu::Buffer,
 }
 
 struct Surface {
@@ -89,6 +90,7 @@ const _: () = assert!(std::mem::size_of::<Stroke>() == 32);
 pub(crate) struct Paint {
     pub paused: bool,
     pub clear: bool,
+    pub passes: u32,
     pub stroke: Option<Stroke>,
 }
 
@@ -221,6 +223,11 @@ impl Gpu {
         };
 
         let gpu_parts = resources(&device, format);
+        queue.write_buffer(
+            &gpu_parts.materials,
+            0,
+            bytemuck::cast_slice(&crate::grid::MATERIALS),
+        );
         let surface = surface.map(|surface| {
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -259,6 +266,7 @@ impl Gpu {
             brush_uniform: gpu_parts.brush_uniform,
             brush_groups: gpu_parts.brush_groups,
             brush_pipeline: gpu_parts.brush_pipeline,
+            materials: gpu_parts.materials,
         })
     }
 
@@ -315,7 +323,7 @@ impl Gpu {
             self.queue.submit([encoder.finish()]);
             return;
         }
-        for _ in 0..PASSES_PER_FRAME {
+        for _ in 0..input.passes {
             let offset = self.passes % 2;
             self.step(offset);
             self.passes += 1;
@@ -630,6 +638,7 @@ struct Parts {
     brush_uniform: wgpu::Buffer,
     brush_groups: [wgpu::BindGroup; 2],
     brush_pipeline: wgpu::ComputePipeline,
+    materials: wgpu::Buffer,
 }
 
 fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
@@ -655,6 +664,13 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let materials = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (crate::grid::MATERIAL_COUNT * std::mem::size_of::<crate::grid::MaterialInfo>())
+            as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[
@@ -673,6 +689,16 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -697,6 +723,14 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &uniform,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &materials,
                         offset: 0,
                         size: None,
                     }),
@@ -775,6 +809,16 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     let sim_groups = [0, 1].map(|index| {
@@ -802,6 +846,14 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &sim_uniform,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &materials,
                         offset: 0,
                         size: None,
                     }),
@@ -909,6 +961,7 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         brush_uniform,
         brush_groups,
         brush_pipeline,
+        materials,
     }
 }
 
@@ -1208,6 +1261,177 @@ mod tests {
         assert_eq!(material_at(&erased, 2, 10), SAND);
         assert_eq!(material_at(&erased, 20, 10), SAND);
         eprintln!("asserted stone survived paint and erase cleared (8,10)-(12,10)");
+    }
+
+    #[test]
+    fn water_levels_in_a_container() {
+        use crate::grid::{EMPTY, STONE, WATER};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        let x0 = 10usize;
+        let x1 = 26usize;
+        let floor = 40usize;
+        for y in 20..=floor {
+            grid.set(x0, y, Cell::pack(STONE, 0, 0, 0));
+            grid.set(x1, y, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in x0..=x1 {
+            grid.set(x, floor, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in 11..15 {
+            for y in 28..floor {
+                grid.set(x, y, Cell::pack(WATER, 0, 0, 0));
+            }
+        }
+        let before = count_material(&grid_cells(&grid), WATER);
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 200)) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, WATER), before);
+        let mut heights = Vec::new();
+        for x in (x0 + 1)..x1 {
+            let height = (20..floor)
+                .filter(|y| material_at(&cells, x, *y) == WATER)
+                .count();
+            heights.push(height);
+            assert_eq!(material_at(&cells, x, floor), STONE);
+        }
+        assert_eq!(material_at(&cells, x0, 30), STONE);
+        assert_eq!(material_at(&cells, x1, 30), STONE);
+        let min = *heights.iter().min().unwrap();
+        let max = *heights.iter().max().unwrap();
+        assert!(max - min <= 1, "heights {heights:?}");
+        assert!(max >= 1, "water vanished");
+        eprintln!("asserted water levelled to heights {min}..={max}");
+    }
+
+    #[test]
+    fn oil_ends_above_water_and_sand_ends_below() {
+        use crate::grid::{EMPTY, OIL, SAND, STONE, WATER};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for y in 10..=24 {
+            grid.set(6, y, Cell::pack(STONE, 0, 0, 0));
+            grid.set(9, y, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in 6..=9 {
+            grid.set(x, 24, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in 7..=8 {
+            for y in 14..=18 {
+                grid.set(x, y, Cell::pack(WATER, 0, 0, 0));
+            }
+            for y in 19..=23 {
+                grid.set(x, y, Cell::pack(OIL, 0, 0, 0));
+            }
+        }
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 40)) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, WATER), 10);
+        assert_eq!(count_material(&cells, OIL), 10);
+        for x in 7..=8 {
+            let oil_bottom = (10..24).filter(|y| material_at(&cells, x, *y) == OIL).max();
+            let water_top = (10..24)
+                .filter(|y| material_at(&cells, x, *y) == WATER)
+                .min();
+            assert!(oil_bottom.unwrap() < water_top.unwrap(), "column {x}");
+        }
+        eprintln!("asserted oil above water");
+
+        let mut sunk = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for y in 10..=24 {
+            sunk.set(6, y, Cell::pack(STONE, 0, 0, 0));
+            sunk.set(9, y, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in 6..=9 {
+            sunk.set(x, 24, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in 7..=8 {
+            for y in 16..=23 {
+                sunk.set(x, y, Cell::pack(WATER, 0, 0, 0));
+            }
+            sunk.set(x, 14, Cell::pack(SAND, 0, 0, 0));
+            sunk.set(x, 15, Cell::pack(SAND, 0, 0, 0));
+        }
+        let Some(cells) = colours(super::Gpu::simulate(&sunk, 40)) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, SAND), 4);
+        assert_eq!(count_material(&cells, WATER), 16);
+        for x in 7..=8 {
+            let sand_top = (10..24)
+                .filter(|y| material_at(&cells, x, *y) == SAND)
+                .min()
+                .unwrap();
+            let water_bottom = (10..24)
+                .filter(|y| material_at(&cells, x, *y) == WATER)
+                .max()
+                .unwrap();
+            assert!(sand_top > water_bottom, "column {x}");
+        }
+        eprintln!("asserted sand below water");
+    }
+
+    #[test]
+    fn smoke_rises_and_then_disappears() {
+        use crate::grid::{EMPTY, SMOKE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(20, 40, Cell::pack(SMOKE, 0, 8, 0));
+        let Some(risen) = colours(super::Gpu::simulate(&grid, 4)) else {
+            return;
+        };
+        assert_eq!(count_material(&risen, SMOKE), 1);
+        let highest = (0..crate::grid::GRID_HEIGHT)
+            .filter(|y| (0..crate::grid::GRID_WIDTH).any(|x| material_at(&risen, x, *y) == SMOKE))
+            .min()
+            .unwrap();
+        assert!(highest < 40, "smoke stayed at {highest}");
+        let Some(gone) = colours(super::Gpu::simulate(&grid, 16)) else {
+            return;
+        };
+        assert_eq!(count_material(&gone, SMOKE), 0);
+        eprintln!("asserted smoke rose above 40 and then vanished");
+    }
+
+    #[test]
+    fn non_gas_mass_is_conserved() {
+        use crate::grid::{EMPTY, OIL, SAND, SMOKE, STONE, WATER};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for i in 0..8 {
+            grid.set(30 + i, 20, Cell::pack(SAND, 0, 0, 0));
+            grid.set(30 + i, 21, Cell::pack(WATER, 0, 0, 0));
+            grid.set(30 + i, 22, Cell::pack(OIL, 0, 0, 0));
+            grid.set(30 + i, 23, Cell::pack(STONE, 0, 0, 0));
+            grid.set(30 + i, 24, Cell::pack(SMOKE, 0, 20, 0));
+        }
+        let before = grid_cells(&grid);
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 30)) else {
+            return;
+        };
+        assert_eq!(count_material(&cells, SAND), count_material(&before, SAND));
+        assert_eq!(
+            count_material(&cells, WATER),
+            count_material(&before, WATER)
+        );
+        assert_eq!(count_material(&cells, OIL), count_material(&before, OIL));
+        assert_eq!(
+            count_material(&cells, STONE),
+            count_material(&before, STONE)
+        );
+        assert!(count_material(&cells, SMOKE) < count_material(&before, SMOKE));
+        eprintln!("asserted sand water oil and stone counts held");
+    }
+
+    fn count_material(cells: &[Cell], material: u8) -> usize {
+        cells
+            .iter()
+            .filter(|cell| cell.material() == material)
+            .count()
+    }
+
+    fn grid_cells(grid: &crate::grid::Grid) -> Vec<Cell> {
+        (0..crate::grid::GRID_HEIGHT)
+            .flat_map(|y| (0..crate::grid::GRID_WIDTH).map(move |x| grid.cell(x, y)))
+            .collect()
     }
 
     #[test]
