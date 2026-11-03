@@ -342,18 +342,18 @@ fn update_block(origin: vec2<u32>) {
 fn update_partition(base: vec2<u32>) {
     if (base.x >= sim.width || base.y >= sim.height) { return; }
     let origin = base + vec2<u32>(sim.offset);
-    if (origin.x < sim.width && origin.y < sim.height) {
-        update_block(origin);
-    }
-    if (sim.offset == 0u) { return; }
-    if (base.x == 0u && origin.y < sim.height) {
-        update_block(vec2<u32>(0xffffffffu, origin.y));
-    }
-    if (base.y == 0u && origin.x < sim.width) {
-        update_block(vec2<u32>(origin.x, 0xffffffffu));
-    }
-    if (all(base == vec2<u32>(0u))) {
-        update_block(vec2<u32>(0xffffffffu));
+    // Edge invocations also own the partial block before row or column zero.
+    // Keep one call site: duplicating the full block shader crashes DX12 WARP.
+    let columns = 1u + select(0u, sim.offset, base.x == 0u);
+    let rows = 1u + select(0u, sim.offset, base.y == 0u);
+    for (var row = 0u; row < rows; row++) {
+        for (var column = 0u; column < columns; column++) {
+            let x = select(origin.x, 0xffffffffu, column != 0u);
+            let y = select(origin.y, 0xffffffffu, row != 0u);
+            if ((column != 0u || x < sim.width) && (row != 0u || y < sim.height)) {
+                update_block(vec2<u32>(x, y));
+            }
+        }
     }
 }
 
