@@ -3133,6 +3133,25 @@ mod tests {
     }
 
     #[test]
+    fn bloom_preserves_uniform_emission_to_the_edges() {
+        let size = Size {
+            width: 31,
+            height: 29,
+        };
+        let fire = crate::grid::Grid::from_fn(|_, _| Cell::pack(crate::grid::FIRE, 0, 1, 0));
+        let Some(on) = colours(super::Gpu::render_scene(&fire, size, true)) else {
+            return;
+        };
+        let centre = pixel(&on.rgba, size.width, 15, 14);
+        for (x, y) in [(0, 0), (30, 28), (30, 14), (15, 28)] {
+            assert_eq!(
+                pixel(&on.rgba, size.width, x, y),
+                centre,
+                "uniform emission at ({x}, {y})"
+            );
+        }
+    }
+    #[test]
     fn first_panel_frame_consumes_font_upload() {
         let grid = crate::grid::Grid::filled(64, 64, |_, _| Cell::pack(0, 0, 0, 0));
         let Some(mut gpu) = open_world(&grid, 0, false) else {
@@ -3698,6 +3717,27 @@ mod tests {
             .count()
     }
 
+    #[test]
+    fn bloom_uses_the_material_emission_for_grains() {
+        use crate::grid::{EMPTY, Grid, MATERIALS, SAND};
+        let mut grid = Grid::filled(32, 32, |_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(16, 16, Cell::pack(SAND, 0, 0, 0));
+        let Some(mut gpu) = open_world(&grid, 0, false) else {
+            return;
+        };
+        let mut materials = MATERIALS;
+        materials[SAND as usize].emissive = 12.0;
+        gpu.queue
+            .write_buffer(&gpu.materials, 0, bytemuck::cast_slice(&materials));
+        let size = Size {
+            width: 32,
+            height: 32,
+        };
+        let off = gpu.read_scene(&grid, size, false);
+        let on = gpu.read_scene(&grid, size, true);
+        let neighbour = |scene: &super::Scene| pixel(&scene.rgba, 32, 17, 16)[0];
+        assert!(neighbour(&on) > neighbour(&off));
+    }
     #[test]
     fn bloom_brightens_the_pixels_next_to_fire() {
         use crate::grid::{EMPTY, FIRE, SAND, STONE};

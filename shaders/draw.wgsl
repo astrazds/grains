@@ -80,7 +80,7 @@ fn shade(position: vec4<f32>) -> Shade {
     let info = materials[material];
     let varied = f32(variation) / 255.0;
     var rgb = info.colour.rgb;
-    var glow = vec3<f32>(0.0);
+    var glow = info.colour.rgb * info.emissive;
     if (info.style == 1u) {
         rgb = info.colour.rgb * (1.0 + (varied - 0.5) * info.grain);
     } else if (info.style == 2u) {

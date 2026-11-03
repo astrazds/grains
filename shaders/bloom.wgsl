@@ -19,13 +19,19 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> VsOut {
     return VsOut(vec4<f32>(xy, 0.0, 1.0));
 }
 
+// Explicit clamp-to-edge for textureLoad, including partial downsample blocks.
+fn sample_source(pixel: vec2<i32>) -> vec3<f32> {
+    let last = vec2<i32>(textureDimensions(source)) - vec2<i32>(1);
+    return textureLoad(source, clamp(pixel, vec2<i32>(0), last), 0).rgb;
+}
+
 @fragment
 fn bright(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let origin = vec2<i32>(floor(position.xy)) * DOWNSAMPLE;
     var sum = vec3<f32>(0.0);
     for (var y = 0; y < DOWNSAMPLE; y++) {
         for (var x = 0; x < DOWNSAMPLE; x++) {
-            sum += textureLoad(source, origin + vec2<i32>(x, y), 0).rgb;
+            sum += sample_source(origin + vec2<i32>(x, y));
         }
     }
     return vec4<f32>(sum / f32(DOWNSAMPLE * DOWNSAMPLE), 1.0);
@@ -33,9 +39,9 @@ fn bright(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
 fn blur_along(step: vec2<i32>, position: vec4<f32>) -> vec4<f32> {
     let pixel = vec2<i32>(floor(position.xy));
-    let centre = textureLoad(source, pixel, 0).rgb;
-    let near = textureLoad(source, pixel + step, 0).rgb + textureLoad(source, pixel - step, 0).rgb;
-    let far = textureLoad(source, pixel + step * 2, 0).rgb + textureLoad(source, pixel - step * 2, 0).rgb;
+    let centre = sample_source(pixel);
+    let near = sample_source(pixel + step) + sample_source(pixel - step);
+    let far = sample_source(pixel + step * 2) + sample_source(pixel - step * 2);
     return vec4<f32>(centre * 0.4 + near * 0.2 + far * 0.1, 1.0);
 }
 
@@ -53,8 +59,8 @@ fn blur_y(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(floor(position.xy));
     let base = textureLoad(source, pixel, 0);
-    let size = vec2<f32>(textureDimensions(source));
-    let uv = (position.xy + vec2<f32>(0.5)) / size;
+    let size = vec2<f32>(textureDimensions(bloom_tex)) * f32(DOWNSAMPLE);
+    let uv = position.xy / size;
     let glow = textureSample(bloom_tex, bloom_sampler, uv);
     let lit = base.rgb + glow.rgb * 0.75;
     if (base.a > 1.5) {
