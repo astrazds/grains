@@ -4,9 +4,9 @@ const LIFE_SHIFT: u32 = 16u;
 const FLAGS_SHIFT: u32 = 24u;
 
 struct Frame {
-    origin_x: i32,
-    origin_y: i32,
-    scale: u32,
+    cell_x: f32,
+    cell_y: f32,
+    zoom: f32,
     grid_width: u32,
     grid_height: u32,
     frame_width: u32,
@@ -57,14 +57,13 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> VsOut {
 }
 
 fn shade(position: vec4<f32>) -> Shade {
-    let pixel = vec2<i32>(floor(position.xy));
     let sky = backdrop(vec2<f32>(position.xy));
-    let local = pixel - vec2<i32>(frame.origin_x, frame.origin_y);
-    if (local.x < 0 || local.y < 0) {
+    let zoom = max(frame.zoom, 0.0001);
+    let looked_up = vec2<f32>(frame.cell_x, frame.cell_y) + position.xy / zoom;
+    if (looked_up.x < 0.0 || looked_up.y < 0.0) {
         return Shade(vec4<f32>(sky, 1.0), vec4<f32>(0.0), true);
     }
-    let scale = i32(frame.scale);
-    let cell = vec2<u32>(u32(local.x / scale), u32(local.y / scale));
+    let cell = vec2<u32>(u32(floor(looked_up.x)), u32(floor(looked_up.y)));
     if (cell.x >= frame.grid_width || cell.y >= frame.grid_height) {
         return Shade(vec4<f32>(sky, 1.0), vec4<f32>(0.0), true);
     }

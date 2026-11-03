@@ -11,11 +11,11 @@ mise install
 cargo run
 ```
 
-The window title is grains. The inner size is 1024 by 600 physical pixels. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Sand, stone, and wood pick up grain from the colour byte on each cell. Fire shifts from yellow-white to deep red as it burns. Water and oil stay a little translucent, and smoke fades into the background.
+The window title is grains. The inner size is 1024 by 600 physical pixels. The world is 2048 by 1152 cells on the desktop and 1024 by 576 in the browser, split into 64 by 64 chunks that sleep when they stop changing. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Sand, stone, and wood pick up grain from the colour byte on each cell. Fire shifts from yellow-white to deep red as it burns. Water and oil stay a little translucent, and smoke fades into the background.
 
 ## Controls
 
-Left click paints. Right click erases. The scroll wheel changes the radius. The panel on the left does the same things, and the brush does not paint while the pointer is over it. The terminal prints the material and the radius when either changes.
+Left click paints. Shift and right click erases. Drag with the middle or right mouse button to pan, and hold Ctrl while scrolling to zoom. The scroll wheel on its own changes the radius. The panel shows how many chunks are awake. The panel on the left does the same things, and the brush does not paint while the pointer is over it. The terminal prints the material and the radius when either changes.
 
 Press `1` for empty, `2` for stone, `3` for sand, `4` for water, `5` for oil, `6` for smoke, `7` for wood, `8` for fire, `9` for steam, or `0` for tnt. Tnt falls like sand. Touching fire detonates it: stone stays, loose grains are thrown clear, and tnt beside the blast goes off too. Press `B` to toggle the fire and steam glow. Press `+` or `-` to change how many simulation passes run each frame. The terminal prints that number. Press `C` to clear the grid. Press Space to pause the fall. The brush still paints while the fall is paused.
 

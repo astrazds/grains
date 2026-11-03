@@ -3,12 +3,15 @@ const KIND_SOLID: u32 = 1u;
 const KIND_POWDER: u32 = 2u;
 const KIND_LIQUID: u32 = 3u;
 const KIND_GAS: u32 = 4u;
-const WIDTH: u32 = 512u;
-const HEIGHT: u32 = 288u;
 const MATERIAL_COUNT: u32 = 10u;
+const CHUNK: u32 = 64u;
 
 struct Sim {
     offset: u32,
+    width: u32,
+    height: u32,
+    awake: u32,
+    chunk_cols: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -36,6 +39,8 @@ struct Reaction {
 @group(0) @binding(2) var<uniform> sim: Sim;
 @group(0) @binding(3) var<storage, read> materials: array<MaterialInfo>;
 @group(0) @binding(4) var<storage, read> reactions: array<Reaction>;
+@group(0) @binding(5) var<storage, read_write> chunk_list: array<u32>;
+@group(0) @binding(6) var<storage, read_write> dirty: array<atomic<u32>>;
 
 fn material_id(word: u32) -> u32 {
     return word & 0xffu;
@@ -58,7 +63,7 @@ fn density_of(word: u32) -> u32 {
 }
 
 fn index_at(x: u32, y: u32) -> u32 {
-    return y * WIDTH + x;
+    return y * sim.width + x;
 }
 
 fn prefer_right(x: u32, y: u32) -> bool {
@@ -95,7 +100,7 @@ fn beside_reaction(word: u32, x: u32, y: u32) -> bool {
     if (x > 0u && reacts_with(word, src[index_at(x - 1u, y)])) {
         return true;
     }
-    if (x + 1u < WIDTH && reacts_with(word, src[index_at(x + 1u, y)])) {
+    if (x + 1u < sim.width && reacts_with(word, src[index_at(x + 1u, y)])) {
         return true;
     }
     return false;
@@ -131,7 +136,7 @@ fn grounded(word: u32, x: u32, y: u32) -> bool {
     var yy = y + 1u;
     var held = true;
     loop {
-        if (yy >= HEIGHT) {
+        if (yy >= sim.height) {
             break;
         }
         let below = src[index_at(x, yy)];
@@ -268,17 +273,31 @@ fn age(word: u32) -> u32 {
 @compute @workgroup_size(8, 8)
 fn step(@builtin(global_invocation_id) id: vec3<u32>) {
     let origin = id.xy * 2u + vec2<u32>(sim.offset, sim.offset);
-    if (origin.x + 1u >= WIDTH || origin.y + 1u >= HEIGHT) {
+    if (origin.x + 1u >= sim.width || origin.y + 1u >= sim.height) {
         return;
     }
+    update_block(origin);
+}
+
+fn mark_dirty(x: u32, y: u32) {
+    let cx = x / CHUNK;
+    let cy = y / CHUNK;
+    atomicOr(&dirty[cy * sim.chunk_cols + cx], 1u);
+}
+
+fn update_block(origin: vec2<u32>) {
     let i0 = index_at(origin.x, origin.y);
     let i1 = index_at(origin.x + 1u, origin.y);
     let i2 = index_at(origin.x, origin.y + 1u);
     let i3 = index_at(origin.x + 1u, origin.y + 1u);
-    var top_left = src[i0];
-    var top_right = src[i1];
-    var bottom_left = src[i2];
-    var bottom_right = src[i3];
+    let was0 = src[i0];
+    let was1 = src[i1];
+    let was2 = src[i2];
+    let was3 = src[i3];
+    var top_left = was0;
+    var top_right = was1;
+    var bottom_left = was2;
+    var bottom_right = was3;
 
     react(&top_left, &bottom_left);
     react(&top_right, &bottom_right);
@@ -304,8 +323,30 @@ fn step(@builtin(global_invocation_id) id: vec3<u32>) {
         spread(&bottom_left, &bottom_right, origin.x, bottom_y, !left_fell, !right_fell);
     }
 
-    dst[i0] = age(top_left);
-    dst[i1] = age(top_right);
-    dst[i2] = age(bottom_left);
-    dst[i3] = age(bottom_right);
+    let next0 = age(top_left);
+    let next1 = age(top_right);
+    let next2 = age(bottom_left);
+    let next3 = age(bottom_right);
+    dst[i0] = next0;
+    dst[i1] = next1;
+    dst[i2] = next2;
+    dst[i3] = next3;
+    if (next0 != was0) { mark_dirty(origin.x, origin.y); }
+    if (next1 != was1) { mark_dirty(origin.x + 1u, origin.y); }
+    if (next2 != was2) { mark_dirty(origin.x, origin.y + 1u); }
+    if (next3 != was3) { mark_dirty(origin.x + 1u, origin.y + 1u); }
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn step_chunks(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.z >= sim.awake || id.x >= 32u || id.y >= 32u) {
+        return;
+    }
+    let packed = chunk_list[id.z];
+    let origin_x = (packed & 0xffffu) * CHUNK + sim.offset + id.x * 2u;
+    let origin_y = (packed >> 16u) * CHUNK + sim.offset + id.y * 2u;
+    if (origin_x + 1u >= sim.width || origin_y + 1u >= sim.height) {
+        return;
+    }
+    update_block(vec2<u32>(origin_x, origin_y));
 }

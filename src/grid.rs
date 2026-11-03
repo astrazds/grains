@@ -1,6 +1,18 @@
 pub const GRID_WIDTH: usize = 512;
 pub const GRID_HEIGHT: usize = 288;
 pub const CELL_COUNT: usize = GRID_WIDTH * GRID_HEIGHT;
+pub const CHUNK: usize = 64;
+
+pub fn world_size() -> (usize, usize) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (1024, 576)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        (2048, 1152)
+    }
+}
 
 pub(crate) const MATERIAL_SHIFT: u32 = 0;
 pub(crate) const VARIATION_SHIFT: u32 = 8;
@@ -286,6 +298,61 @@ pub struct Fit {
     pub origin_y: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Camera {
+    pub cell_x: f32,
+    pub cell_y: f32,
+    pub zoom: f32,
+}
+
+impl Camera {
+    pub fn centered(world_w: u32, world_h: u32, view_w: u32, view_h: u32) -> Self {
+        let zoom = (view_w as f32 / 512.0).clamp(1.0, 8.0);
+        Self {
+            cell_x: (world_w as f32 - view_w as f32 / zoom) * 0.5,
+            cell_y: (world_h as f32 - view_h as f32 / zoom) * 0.5,
+            zoom,
+        }
+    }
+
+    pub fn pan(&mut self, dx: f32, dy: f32, world_w: u32, world_h: u32, view_w: u32, view_h: u32) {
+        self.cell_x = (self.cell_x - dx / self.zoom).clamp(0.0, world_w as f32);
+        self.cell_y = (self.cell_y - dy / self.zoom).clamp(0.0, world_h as f32);
+        let _ = (view_w, view_h);
+    }
+
+    pub fn zoom_at(&mut self, cursor_x: f32, cursor_y: f32, factor: f32) {
+        let world_x = self.cell_x + cursor_x / self.zoom;
+        let world_y = self.cell_y + cursor_y / self.zoom;
+        self.zoom = (self.zoom * factor).clamp(0.25, 16.0);
+        self.cell_x = world_x - cursor_x / self.zoom;
+        self.cell_y = world_y - cursor_y / self.zoom;
+    }
+}
+
+pub fn cell_at_camera(
+    pixel_x: f32,
+    pixel_y: f32,
+    camera: Camera,
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32)> {
+    if camera.zoom <= 0.0 {
+        return None;
+    }
+    let x = camera.cell_x + pixel_x / camera.zoom;
+    let y = camera.cell_y + pixel_y / camera.zoom;
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let cell_x = x.floor() as u32;
+    let cell_y = y.floor() as u32;
+    if cell_x >= width || cell_y >= height {
+        return None;
+    }
+    Some((cell_x, cell_y))
+}
+
 pub fn cell_at(pixel_x: i32, pixel_y: i32, fit: Fit) -> Option<(u32, u32)> {
     if fit.scale == 0 {
         return None;
@@ -324,7 +391,9 @@ pub fn letterbox(size: Size) -> Option<Fit> {
 }
 
 pub struct Grid {
-    cells: Box<[Cell; CELL_COUNT]>,
+    width: usize,
+    height: usize,
+    cells: Box<[Cell]>,
 }
 
 impl Grid {
@@ -336,8 +405,74 @@ impl Grid {
             }
         }
         Self {
-            cells: heap_cells(cells),
+            width: GRID_WIDTH,
+            height: GRID_HEIGHT,
+            cells: cells.into_boxed_slice(),
         }
+    }
+
+    pub fn filled(width: usize, height: usize, mut each: impl FnMut(usize, usize) -> Cell) -> Self {
+        let mut cells = vec![Cell::pack(0, 0, 0, 0); width * height];
+        for y in 0..height {
+            for x in 0..width {
+                cells[y * width + x] = each(x, y);
+            }
+        }
+        Self {
+            width,
+            height,
+            cells: cells.into_boxed_slice(),
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn demo_world() -> Self {
+        let (width, height) = world_size();
+        let ox = width / 2 - GRID_WIDTH / 2;
+        let oy = height / 2 - GRID_HEIGHT / 2;
+        Self::filled(width, height, |x, y| {
+            let lx = x as isize - ox as isize;
+            let ly = y as isize - oy as isize;
+            if lx < 0 || ly < 0 || lx as usize >= GRID_WIDTH || ly as usize >= GRID_HEIGHT {
+                return Cell::pack(EMPTY, 0, 0, 0);
+            }
+            let x = lx as usize;
+            let y = ly as usize;
+            if y == GRID_HEIGHT - 1 || ledge(x, y) {
+                Cell::pack(STONE, grain(x, y), 0, 0)
+            } else if sand_pile(x, y) {
+                Cell::pack(SAND, grain(x, y), 0, 0)
+            } else {
+                Cell::pack(EMPTY, 0, 0, 0)
+            }
+        })
+    }
+
+    pub fn place(&mut self, width: u32, height: u32, words: &[u32]) -> Result<(), String> {
+        if words.len() != width as usize * height as usize {
+            return Err("this world has the wrong number of cells".to_string());
+        }
+        if width as usize > self.width || height as usize > self.height {
+            return Err(format!(
+                "this world is {width} by {height}, which is larger than grains can load"
+            ));
+        }
+        for cell in self.cells.iter_mut() {
+            *cell = Cell::pack(EMPTY, 0, 0, 0);
+        }
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                self.cells[y * self.width + x] = Cell::from_bits(words[y * width as usize + x]);
+            }
+        }
+        Ok(())
     }
 
     pub fn demo() -> Self {
@@ -360,16 +495,15 @@ impl Grid {
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Cell {
-        self.cells[index(x, y)]
+        self.cells[y * self.width + x]
     }
 
     pub fn set(&mut self, x: usize, y: usize, cell: Cell) {
-        let index = index(x, y);
-        self.cells[index] = cell;
+        self.cells[y * self.width + x] = cell;
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        bytemuck::cast_slice(self.cells.as_slice())
+        bytemuck::cast_slice(&self.cells)
     }
 
     pub fn from_words(words: &[u32]) -> Result<Self, String> {
@@ -377,11 +511,11 @@ impl Grid {
             return Err("this world has the wrong number of cells".to_string());
         }
         let cells: Vec<Cell> = words.iter().copied().map(Cell::from_bits).collect();
-        let cells: Box<[Cell; CELL_COUNT]> = cells
-            .into_boxed_slice()
-            .try_into()
-            .map_err(|_| "this world has the wrong number of cells".to_string())?;
-        Ok(Self { cells })
+        Ok(Self {
+            width: GRID_WIDTH,
+            height: GRID_HEIGHT,
+            cells: cells.into_boxed_slice(),
+        })
     }
 }
 
@@ -391,13 +525,6 @@ fn index(x: usize, y: usize) -> usize {
         "{x},{y} outside the grid"
     );
     y * GRID_WIDTH + x
-}
-
-fn heap_cells(cells: Vec<Cell>) -> Box<[Cell; CELL_COUNT]> {
-    cells
-        .into_boxed_slice()
-        .try_into()
-        .unwrap_or_else(|_| panic!("grid length is not {CELL_COUNT}"))
 }
 
 fn ledge(x: usize, y: usize) -> bool {
@@ -498,6 +625,24 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn the_camera_maps_a_pixel_onto_a_cell() {
+        let camera = super::Camera {
+            cell_x: 10.0,
+            cell_y: 4.0,
+            zoom: 2.0,
+        };
+        assert_eq!(
+            super::cell_at_camera(0.0, 0.0, camera, 128, 128),
+            Some((10, 4))
+        );
+        assert_eq!(
+            super::cell_at_camera(3.9, 1.0, camera, 128, 128),
+            Some((11, 4))
+        );
+        assert_eq!(super::cell_at_camera(300.0, 0.0, camera, 128, 128), None);
     }
 
     #[test]

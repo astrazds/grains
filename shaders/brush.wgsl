@@ -1,6 +1,4 @@
 const STONE: u32 = 2u;
-const WIDTH: u32 = 512u;
-const HEIGHT: u32 = 288u;
 
 struct Brush {
     x0: i32,
@@ -11,6 +9,10 @@ struct Brush {
     material: u32,
     erase: u32,
     clear: u32,
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> cells: array<u32>;
@@ -33,10 +35,10 @@ fn distance_to_stroke(x: f32, y: f32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn paint(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= WIDTH || id.y >= HEIGHT) {
+    if (id.x >= brush.width || id.y >= brush.height) {
         return;
     }
-    let index = id.y * WIDTH + id.x;
+    let index = id.y * brush.width + id.x;
     if (brush.clear != 0u) {
         cells[index] = 0u;
         return;

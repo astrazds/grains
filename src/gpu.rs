@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::grid::{CELL_COUNT, GRID_HEIGHT, GRID_WIDTH, Grid, LETTERBOX, Size, letterbox};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::grid::{GRID_HEIGHT, GRID_WIDTH};
+use crate::grid::{Grid, LETTERBOX, Size, letterbox};
 
 #[derive(Debug)]
 pub struct NoAdapter {
@@ -34,6 +36,7 @@ pub(crate) struct Gpu {
     sim_uniform: wgpu::Buffer,
     sim_groups: [wgpu::BindGroup; 2],
     sim_pipeline: wgpu::ComputePipeline,
+    sim_chunks_pipeline: wgpu::ComputePipeline,
     brush_uniform: wgpu::Buffer,
     brush_groups: [wgpu::BindGroup; 2],
     brush_pipeline: wgpu::ComputePipeline,
@@ -46,6 +49,14 @@ pub(crate) struct Gpu {
     // Bind groups borrow this buffer. The field keeps it alive.
     #[allow(dead_code)]
     reactions: wgpu::Buffer,
+    world_w: u32,
+    world_h: u32,
+    chunked: bool,
+    awake: Vec<bool>,
+    quiet: Vec<u8>,
+    chunk_list: wgpu::Buffer,
+    dirty: wgpu::Buffer,
+    camera: Option<crate::grid::Camera>,
     // Bind groups borrow these buffers. The fields keep them alive.
     #[allow(dead_code)]
     particles: wgpu::Buffer,
@@ -83,9 +94,9 @@ const _: () = assert!(std::mem::size_of::<Speck>() == 32);
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
-    origin_x: i32,
-    origin_y: i32,
-    scale: u32,
+    cell_x: f32,
+    cell_y: f32,
+    zoom: f32,
     grid_width: u32,
     grid_height: u32,
     frame_width: u32,
@@ -99,12 +110,16 @@ const _: () = assert!(std::mem::size_of::<Uniforms>() == 32);
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SimUniform {
     offset: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    width: u32,
+    height: u32,
+    awake: u32,
+    chunk_cols: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<SimUniform>() == 16);
+const _: () = assert!(std::mem::size_of::<SimUniform>() == 32);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -163,12 +178,14 @@ fn backends() -> wgpu::Backends {
 impl Gpu {
     pub(crate) async fn for_window(window: Arc<Window>) -> Result<Self, NoAdapter> {
         let size = window.inner_size();
+        let (width, height) = crate::grid::world_size();
         Self::open(
             Some(window),
             Size {
                 width: size.width,
                 height: size.height,
             },
+            (width as u32, height as u32),
         )
         .await
     }
@@ -186,7 +203,11 @@ impl Gpu {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut gpu = pollster::block_on(Self::open(None, size))?;
+            let mut gpu = pollster::block_on(Self::open(
+                None,
+                size,
+                (GRID_WIDTH as u32, GRID_HEIGHT as u32),
+            ))?;
             Ok(gpu.read_scene(grid, size, bloom))
         }
         #[cfg(target_arch = "wasm32")]
@@ -237,7 +258,11 @@ impl Gpu {
         }
     }
 
-    async fn open(window: Option<Arc<Window>>, size: Size) -> Result<Self, NoAdapter> {
+    async fn open(
+        window: Option<Arc<Window>>,
+        size: Size,
+        world: (u32, u32),
+    ) -> Result<Self, NoAdapter> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends();
         let instance = wgpu::Instance::new(descriptor);
@@ -286,7 +311,8 @@ impl Gpu {
             return Err(NoAdapter { names });
         };
 
-        let gpu_parts = resources(&device, format);
+        let gpu_parts = resources(&device, format, world.0, world.1);
+        let chunks = chunk_count(world.0, world.1);
         queue.write_buffer(
             &gpu_parts.materials,
             0,
@@ -333,6 +359,7 @@ impl Gpu {
             sim_uniform: gpu_parts.sim_uniform,
             sim_groups: gpu_parts.sim_groups,
             sim_pipeline: gpu_parts.sim_pipeline,
+            sim_chunks_pipeline: gpu_parts.sim_chunks_pipeline,
             brush_uniform: gpu_parts.brush_uniform,
             brush_groups: gpu_parts.brush_groups,
             brush_pipeline: gpu_parts.brush_pipeline,
@@ -341,6 +368,14 @@ impl Gpu {
             egui: None,
             materials: gpu_parts.materials,
             reactions: gpu_parts.reactions,
+            world_w: world.0,
+            world_h: world.1,
+            chunked: true,
+            awake: vec![true; chunks],
+            quiet: vec![0; chunks],
+            chunk_list: gpu_parts.chunk_list,
+            dirty: gpu_parts.dirty,
+            camera: None,
             particles: gpu_parts.particles,
             claims: gpu_parts.claims,
             blast_groups: gpu_parts.blast_groups,
@@ -518,42 +553,210 @@ impl Gpu {
     }
 
     fn step(&mut self, offset: u32) {
+        if self.chunked && self.awake.iter().all(|on| !on) {
+            return;
+        }
         let src = self.front;
         let dst = src ^ 1;
+        let list = if self.chunked {
+            self.live_chunks()
+        } else {
+            Vec::new()
+        };
+        let awake = if self.chunked {
+            list.len() as u32
+        } else {
+            u32::MAX
+        };
         let sim = SimUniform {
             offset,
-            pad0: 0,
-            pad1: 0,
-            pad2: 0,
+            width: self.world_w,
+            height: self.world_h,
+            awake,
+            chunk_cols: chunk_cols(self.world_w) as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue
             .write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&sim));
+        if self.chunked && !list.is_empty() {
+            let bytes: Vec<u8> = list.iter().flat_map(|word| word.to_le_bytes()).collect();
+            self.queue.write_buffer(&self.chunk_list, 0, &bytes);
+            self.queue
+                .write_buffer(&self.dirty, 0, &vec![0u8; self.awake.len() * 4]);
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let bytes = (CELL_COUNT * 4) as u64;
+        let bytes = (self.world_w as u64) * (self.world_h as u64) * 4;
         encoder.copy_buffer_to_buffer(&self.cells[src], 0, &self.cells[dst], 0, bytes);
-        // The blast reads the copy and writes each cell of the live buffer.
-        // Margolus then reads that result. Nothing in either pass shares a write.
-        self.dispatch(&mut encoder, &self.blast_pipeline, src);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.sim_pipeline);
-            pass.set_bind_group(0, &self.sim_groups[src], &[]);
-            let (groups_x, groups_y) = workgroups(offset);
-            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        if self.chunked {
+            let count = list.len() as u32;
+            self.dispatch_cells(&mut encoder, &self.blast_pipeline, src, count);
+            self.dispatch_blocks(&mut encoder, src, count);
+            self.dispatch_cells(&mut encoder, &self.fly_pipeline, src, count);
+            self.dispatch_cells(&mut encoder, &self.clear_claims_pipeline, src, count);
+            self.dispatch_cells(&mut encoder, &self.claim_pipeline, src, count);
+            self.dispatch_cells(&mut encoder, &self.land_pipeline, src, count);
+            self.dispatch_cells(&mut encoder, &self.nudge_pipeline, src, count);
+        } else {
+            self.dispatch(&mut encoder, &self.blast_pipeline, src);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.sim_pipeline);
+                pass.set_bind_group(0, &self.sim_groups[src], &[]);
+                let (groups_x, groups_y) = workgroups(self.world_w, self.world_h, offset);
+                pass.dispatch_workgroups(groups_x, groups_y, 1);
+            }
+            self.dispatch(&mut encoder, &self.fly_pipeline, src);
+            self.dispatch(&mut encoder, &self.clear_claims_pipeline, src);
+            self.dispatch(&mut encoder, &self.claim_pipeline, src);
+            self.dispatch(&mut encoder, &self.land_pipeline, src);
+            self.dispatch(&mut encoder, &self.nudge_pipeline, src);
         }
-        self.dispatch(&mut encoder, &self.fly_pipeline, src);
-        self.dispatch(&mut encoder, &self.clear_claims_pipeline, src);
-        self.dispatch(&mut encoder, &self.claim_pipeline, src);
-        self.dispatch(&mut encoder, &self.land_pipeline, src);
-        self.dispatch(&mut encoder, &self.nudge_pipeline, src);
         self.queue.submit([encoder.finish()]);
         self.front = dst;
+        if self.chunked {
+            self.note_changes();
+        }
     }
+
+    fn dispatch_blocks(&self, encoder: &mut wgpu::CommandEncoder, src: usize, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.sim_chunks_pipeline);
+        pass.set_bind_group(0, &self.sim_groups[src], &[]);
+        pass.dispatch_workgroups(4, 4, count);
+    }
+
+    fn dispatch_cells(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        src: usize,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.blast_groups[src], &[]);
+        pass.dispatch_workgroups(8, 8, count);
+    }
+
+    fn live_chunks(&self) -> Vec<u32> {
+        let cols = chunk_cols(self.world_w);
+        let rows = chunk_rows(self.world_h);
+        let mut live = vec![false; cols * rows];
+        for y in 0..rows {
+            for x in 0..cols {
+                if !self.awake[y * cols + x] {
+                    continue;
+                }
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx >= 0 && ny >= 0 && (nx as usize) < cols && (ny as usize) < rows {
+                            live[ny as usize * cols + nx as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+        live.iter()
+            .enumerate()
+            .filter(|(_, on)| **on)
+            .map(|(index, _)| {
+                let cx = (index % cols) as u32;
+                let cy = (index / cols) as u32;
+                cx | (cy << 16)
+            })
+            .collect()
+    }
+
+    fn wake_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let cols = chunk_cols(self.world_w) as i32;
+        let rows = chunk_rows(self.world_h) as i32;
+        let c0x = (x0.div_euclid(crate::grid::CHUNK as i32)).clamp(0, cols - 1);
+        let c1x = (x1.div_euclid(crate::grid::CHUNK as i32)).clamp(0, cols - 1);
+        let c0y = (y0.div_euclid(crate::grid::CHUNK as i32)).clamp(0, rows - 1);
+        let c1y = (y1.div_euclid(crate::grid::CHUNK as i32)).clamp(0, rows - 1);
+        for cy in (c0y - 1)..=(c1y + 1) {
+            for cx in (c0x - 1)..=(c1x + 1) {
+                if cx < 0 || cy < 0 || cx >= cols || cy >= rows {
+                    continue;
+                }
+                let index = cy as usize * cols as usize + cx as usize;
+                self.awake[index] = true;
+                self.quiet[index] = 0;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn note_changes(&mut self) {
+        let bytes = (self.awake.len() * 4) as u64;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&self.dirty, 0, &buffer, 0, bytes);
+        self.queue.submit([encoder.finish()]);
+        let mapped = map_buffer(&self.device, &buffer);
+        let dirty: Vec<u32> = bytemuck::cast_slice(&mapped).to_vec();
+        let cols = chunk_cols(self.world_w);
+        let rows = chunk_rows(self.world_h);
+        let mut wake = vec![false; dirty.len()];
+        for (index, flag) in dirty.iter().enumerate() {
+            if *flag == 0 {
+                continue;
+            }
+            let x = index % cols;
+            let y = index / cols;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx >= 0 && ny >= 0 && (nx as usize) < cols && (ny as usize) < rows {
+                        wake[ny as usize * cols + nx as usize] = true;
+                    }
+                }
+            }
+        }
+        for (index, wake_it) in wake.iter().enumerate() {
+            if *wake_it {
+                self.awake[index] = true;
+                self.quiet[index] = 0;
+            } else if self.awake[index] {
+                self.quiet[index] = self.quiet[index].saturating_add(1);
+                if self.quiet[index] >= 4 {
+                    self.awake[index] = false;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn note_changes(&mut self) {}
 
     fn dispatch(
         &self,
@@ -567,13 +770,41 @@ impl Gpu {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.blast_groups[src], &[]);
-        let (groups_x, groups_y) = cell_groups();
+        let (groups_x, groups_y) = cell_groups(self.world_w, self.world_h);
         pass.dispatch_workgroups(groups_x, groups_y, 1);
     }
 
     fn apply_brush(&mut self, stroke: Stroke) {
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Upload {
+            stroke: Stroke,
+            width: u32,
+            height: u32,
+            pad0: u32,
+            pad1: u32,
+        }
+        let upload = Upload {
+            stroke,
+            width: self.world_w,
+            height: self.world_h,
+            pad0: 0,
+            pad1: 0,
+        };
         self.queue
-            .write_buffer(&self.brush_uniform, 0, bytemuck::bytes_of(&stroke));
+            .write_buffer(&self.brush_uniform, 0, bytemuck::bytes_of(&upload));
+        if stroke.clear != 0 {
+            self.awake.fill(true);
+            self.quiet.fill(0);
+        } else {
+            let reach = stroke.radius as i32;
+            self.wake_rect(
+                stroke.from_x.min(stroke.to_x) - reach,
+                stroke.from_y.min(stroke.to_y) - reach,
+                stroke.from_x.max(stroke.to_x) + reach,
+                stroke.from_y.max(stroke.to_y) + reach,
+            );
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -584,7 +815,7 @@ impl Gpu {
             });
             pass.set_pipeline(&self.brush_pipeline);
             pass.set_bind_group(0, &self.brush_groups[self.front], &[]);
-            let (groups_x, groups_y) = cell_groups();
+            let (groups_x, groups_y) = cell_groups(self.world_w, self.world_h);
             pass.dispatch_workgroups(groups_x, groups_y, 1);
         }
         self.queue.submit([encoder.finish()]);
@@ -592,7 +823,11 @@ impl Gpu {
 
     #[cfg(test)]
     pub(crate) fn preview(grid: &Grid, passes: u32, size: Size) -> Result<Vec<u8>, NoAdapter> {
-        let mut gpu = pollster::block_on(Self::open(None, size))?;
+        let mut gpu = pollster::block_on(Self::open(
+            None,
+            size,
+            (GRID_WIDTH as u32, GRID_HEIGHT as u32),
+        ))?;
         gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
         for pass in 0..passes {
             gpu.step(pass % 2);
@@ -668,6 +903,7 @@ impl Gpu {
                 width: GRID_WIDTH as u32,
                 height: GRID_HEIGHT as u32,
             },
+            (GRID_WIDTH as u32, GRID_HEIGHT as u32),
         ))?;
         gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
         gpu.front = 0;
@@ -683,6 +919,7 @@ impl Gpu {
                 width: GRID_WIDTH as u32,
                 height: GRID_HEIGHT as u32,
             },
+            (GRID_WIDTH as u32, GRID_HEIGHT as u32),
         ))?;
         gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
         let mut gpu = gpu;
@@ -707,7 +944,7 @@ impl Gpu {
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn snapshot_then(&self, done: impl FnOnce(Result<Vec<u32>, String>) + 'static) {
-        let bytes = (CELL_COUNT * 4) as u64;
+        let bytes = (self.world_w as u64) * (self.world_h as u64) * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: bytes,
@@ -741,7 +978,7 @@ impl Gpu {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn read_cells(&self, index: usize) -> Vec<crate::grid::Cell> {
-        let bytes = (CELL_COUNT * 4) as u64;
+        let bytes = (self.world_w as u64) * (self.world_h as u64) * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: bytes,
@@ -759,7 +996,8 @@ impl Gpu {
 
     #[cfg(test)]
     fn read_specks(&self) -> Vec<Speck> {
-        let bytes = (CELL_COUNT * std::mem::size_of::<Speck>()) as u64;
+        let bytes =
+            (self.world_w as u64) * (self.world_h as u64) * std::mem::size_of::<Speck>() as u64;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: bytes,
@@ -875,21 +1113,59 @@ impl Gpu {
         pass.draw(0..3, 0..1);
     }
 
+    pub(crate) fn set_camera(&mut self, camera: crate::grid::Camera) {
+        self.camera = Some(camera);
+    }
+
+    pub(crate) fn wake_all(&mut self) {
+        self.awake.fill(true);
+        self.quiet.fill(0);
+    }
+
+    #[cfg(test)]
+    fn chunk_awake(&self, x: usize, y: usize) -> bool {
+        let cols = chunk_cols(self.world_w);
+        self.awake[y * cols + x]
+    }
+
+    pub(crate) fn chunk_stats(&self) -> (u32, u32) {
+        let awake = self.awake.iter().filter(|on| **on).count() as u32;
+        (awake, self.awake.len() as u32)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_chunked(&mut self, chunked: bool) {
+        self.chunked = chunked;
+    }
+
     fn prepare_frame(&self, size: Size) -> Option<(f32, f32, f32, f32)> {
-        let fit = letterbox(size)?;
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let (cell_x, cell_y, zoom) = if let Some(camera) = self.camera {
+            (camera.cell_x, camera.cell_y, camera.zoom)
+        } else {
+            let fit = letterbox(size)?;
+            let zoom = fit.scale as f32;
+            (
+                -(fit.origin_x as f32) / zoom,
+                -(fit.origin_y as f32) / zoom,
+                zoom,
+            )
+        };
         let uniforms = Uniforms {
-            origin_x: fit.origin_x,
-            origin_y: fit.origin_y,
-            scale: fit.scale,
-            grid_width: GRID_WIDTH as u32,
-            grid_height: GRID_HEIGHT as u32,
+            cell_x,
+            cell_y,
+            zoom,
+            grid_width: self.world_w,
+            grid_height: self.world_h,
             frame_width: size.width,
             frame_height: size.height,
             _pad: 0,
         };
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniforms));
-        viewport(fit, size)
+        Some((0.0, 0.0, size.width as f32, size.height as f32))
     }
 
     fn ensure_bloom(&mut self) {
@@ -935,6 +1211,7 @@ struct Parts {
     sim_uniform: wgpu::Buffer,
     sim_groups: [wgpu::BindGroup; 2],
     sim_pipeline: wgpu::ComputePipeline,
+    sim_chunks_pipeline: wgpu::ComputePipeline,
     brush_uniform: wgpu::Buffer,
     brush_groups: [wgpu::BindGroup; 2],
     brush_pipeline: wgpu::ComputePipeline,
@@ -942,6 +1219,8 @@ struct Parts {
     reactions: wgpu::Buffer,
     particles: wgpu::Buffer,
     claims: wgpu::Buffer,
+    chunk_list: wgpu::Buffer,
+    dirty: wgpu::Buffer,
     blast_groups: [wgpu::BindGroup; 2],
     blast_pipeline: wgpu::ComputePipeline,
     fly_pipeline: wgpu::ComputePipeline,
@@ -951,13 +1230,20 @@ struct Parts {
     nudge_pipeline: wgpu::ComputePipeline,
 }
 
-fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
+fn resources(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    world_w: u32,
+    world_h: u32,
+) -> Parts {
+    let cells_len = world_w as usize * world_h as usize;
+    let chunks = chunk_count(world_w, world_h);
     let usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
     let cells = [0, 1].map(|_| {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (CELL_COUNT * 4) as u64,
+            size: (cells_len * 4) as u64,
             usage,
             mapped_at_creation: false,
         })
@@ -970,10 +1256,12 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
     });
     let sim_uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 16,
+        size: 32,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let chunk_list = zeroed_buffer(device, (chunks.max(1) * 4) as u64);
+    let dirty = zeroed_buffer(device, (chunks.max(1) * 4) as u64);
     let materials = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: (crate::grid::MATERIAL_COUNT * std::mem::size_of::<crate::grid::MaterialInfo>())
@@ -1145,6 +1433,8 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                 },
                 count: None,
             },
+            storage_entry(5),
+            storage_entry(6),
         ],
     });
     let sim_groups = [0, 1].map(|index| {
@@ -1192,6 +1482,8 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                         size: None,
                     }),
                 },
+                buffer_entry(5, &chunk_list),
+                buffer_entry(6, &dirty),
             ],
         })
     });
@@ -1212,9 +1504,17 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         compilation_options: Default::default(),
         cache: None,
     });
+    let sim_chunks_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&sim_pipeline_layout),
+        module: &sim_shader,
+        entry_point: Some("step_chunks"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
     let brush_uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 32,
+        size: 48,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1284,8 +1584,8 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         compilation_options: Default::default(),
         cache: None,
     });
-    let particles = zeroed_buffer(device, (CELL_COUNT * 32) as u64);
-    let claims = zeroed_buffer(device, (CELL_COUNT * 4) as u64);
+    let particles = zeroed_buffer(device, (cells_len * 32) as u64);
+    let claims = zeroed_buffer(device, (cells_len * 4) as u64);
     let blast_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blast.wgsl").into()),
@@ -1297,6 +1597,17 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
             storage_entry(1),
             storage_entry(2),
             storage_entry(3),
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            storage_entry(5),
         ],
     });
     let blast_groups = [0, 1].map(|index| {
@@ -1308,6 +1619,8 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
                 buffer_entry(1, &cells[index ^ 1]),
                 buffer_entry(2, &particles),
                 buffer_entry(3, &claims),
+                buffer_entry(4, &sim_uniform),
+                buffer_entry(5, &chunk_list),
             ],
         })
     });
@@ -1334,6 +1647,7 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         sim_uniform,
         sim_groups,
         sim_pipeline,
+        sim_chunks_pipeline,
         brush_uniform,
         brush_groups,
         brush_pipeline,
@@ -1341,6 +1655,8 @@ fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
         reactions,
         particles,
         claims,
+        chunk_list,
+        dirty,
         blast_groups,
         blast_pipeline: blast_pipe("blast"),
         fly_pipeline: blast_pipe("fly"),
@@ -1394,17 +1710,26 @@ fn zeroed_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     buffer
 }
 
-fn cell_groups() -> (u32, u32) {
-    (
-        (GRID_WIDTH as u32).div_ceil(8),
-        (GRID_HEIGHT as u32).div_ceil(8),
-    )
+fn cell_groups(width: u32, height: u32) -> (u32, u32) {
+    (width.div_ceil(8), height.div_ceil(8))
 }
 
-fn workgroups(offset: u32) -> (u32, u32) {
-    let blocks_x = (GRID_WIDTH as u32 - offset) / 2;
-    let blocks_y = (GRID_HEIGHT as u32 - offset) / 2;
+fn workgroups(width: u32, height: u32, offset: u32) -> (u32, u32) {
+    let blocks_x = (width - offset) / 2;
+    let blocks_y = (height - offset) / 2;
     (blocks_x.div_ceil(8), blocks_y.div_ceil(8))
+}
+
+fn chunk_cols(width: u32) -> usize {
+    (width as usize).div_ceil(crate::grid::CHUNK)
+}
+
+fn chunk_rows(height: u32) -> usize {
+    (height as usize).div_ceil(crate::grid::CHUNK)
+}
+
+fn chunk_count(width: u32, height: u32) -> usize {
+    chunk_cols(width) * chunk_rows(height)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1766,26 +2091,6 @@ fn hdr_pipeline(
     })
 }
 
-fn viewport(fit: crate::grid::Fit, size: Size) -> Option<(f32, f32, f32, f32)> {
-    let x0 = fit.origin_x;
-    let y0 = fit.origin_y;
-    let x1 = fit.origin_x + GRID_WIDTH as i32 * fit.scale as i32;
-    let y1 = fit.origin_y + GRID_HEIGHT as i32 * fit.scale as i32;
-    let left = x0.max(0).min(size.width as i32);
-    let top = y0.max(0).min(size.height as i32);
-    let right = x1.max(0).min(size.width as i32);
-    let bottom = y1.max(0).min(size.height as i32);
-    if right <= left || bottom <= top {
-        return None;
-    }
-    Some((
-        left as f32,
-        top as f32,
-        (right - left) as f32,
-        (bottom - top) as f32,
-    ))
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn padded_row_bytes(width: u32, bytes_per_pixel: u32) -> u32 {
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -1970,6 +2275,7 @@ mod tests {
                 width: 512,
                 height: 288,
             },
+            (512, 288),
         )) {
             Ok(gpu) => gpu,
             Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
@@ -1982,7 +2288,7 @@ mod tests {
         };
         gpu.store(&grid);
         let before = gpu.snapshot();
-        let file = crate::world::encode(&before).expect("encode");
+        let file = crate::world::encode(&before, 512, 288).expect("encode");
         gpu.apply_brush(super::Stroke {
             from_x: 0,
             from_y: 0,
@@ -1995,8 +2301,8 @@ mod tests {
         });
         let cleared = gpu.snapshot();
         assert_eq!(cleared[4 * 512 + 3], 0, "clear left the sand cell");
-        let words = crate::world::decode(&file).expect("decode");
-        let loaded = crate::grid::Grid::from_words(&words).expect("grid");
+        let saved = crate::world::decode(&file).expect("decode");
+        let loaded = crate::grid::Grid::from_words(&saved.words).expect("grid");
         gpu.store(&loaded);
         let after = gpu.snapshot();
         assert_eq!(after, before);
@@ -2119,6 +2425,146 @@ mod tests {
         grid
     }
 
+    #[test]
+    fn chunking_matches_a_full_simulation() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let grid = crate::grid::Grid::filled(128, 128, |x, y| {
+            if y == 120 && (16..48).contains(&x) {
+                Cell::pack(STONE, 0, 0, 0)
+            } else if (20..36).contains(&x) && (8..24).contains(&y) {
+                Cell::pack(SAND, (x * 3) as u8, 0, 0)
+            } else {
+                Cell::pack(EMPTY, 0, 0, 0)
+            }
+        });
+        let Some(chunked) = run_world(&grid, 40, true) else {
+            return;
+        };
+        let Some(full) = run_world(&grid, 40, false) else {
+            return;
+        };
+        assert_eq!(chunked, full);
+        eprintln!("asserted chunked and full simulations matched");
+    }
+
+    #[test]
+    fn a_settled_scene_sleeps() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let grid = crate::grid::Grid::filled(128, 128, |x, y| {
+            if y == 40 {
+                Cell::pack(STONE, 0, 0, 0)
+            } else if y == 39 && (10..20).contains(&x) {
+                Cell::pack(SAND, 1, 0, 0)
+            } else {
+                Cell::pack(EMPTY, 0, 0, 0)
+            }
+        });
+        let Some(gpu) = open_world(&grid, 6, true) else {
+            return;
+        };
+        let (awake, total) = gpu.chunk_stats();
+        assert_eq!(awake, 0, "{awake} chunks stayed awake out of {total}");
+        eprintln!("asserted a settled scene slept all {total} chunks");
+    }
+
+    #[test]
+    fn painting_wakes_only_nearby_chunks() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let grid = crate::grid::Grid::filled(256, 128, |x, y| {
+            if y == 40 {
+                Cell::pack(STONE, 0, 0, 0)
+            } else if y == 39 && x == 10 {
+                Cell::pack(SAND, 1, 0, 0)
+            } else {
+                Cell::pack(EMPTY, 0, 0, 0)
+            }
+        });
+        let Some(mut gpu) = open_world(&grid, 6, true) else {
+            return;
+        };
+        assert_eq!(gpu.chunk_stats().0, 0);
+        gpu.apply_brush(super::Stroke {
+            from_x: 10,
+            from_y: 10,
+            to_x: 10,
+            to_y: 10,
+            radius: 2,
+            material: crate::grid::spawn_word(SAND),
+            erase: 0,
+            clear: 0,
+        });
+        assert!(gpu.chunk_awake(0, 0));
+        assert!(!gpu.chunk_awake(3, 0), "a far chunk woke up");
+        eprintln!("asserted painting woke the nearby chunks only");
+    }
+
+    #[test]
+    fn time_a_settled_world_against_a_full_dispatch() {
+        use crate::grid::EMPTY;
+        use std::time::Instant;
+        let grid = crate::grid::Grid::filled(2048, 1152, |_, _| Cell::pack(EMPTY, 0, 0, 0));
+        let Some(mut asleep) = open_world(&grid, 6, true) else {
+            return;
+        };
+        assert_eq!(asleep.chunk_stats().0, 0);
+        let started = Instant::now();
+        for pass in 0..20 {
+            asleep.step(pass % 2);
+        }
+        asleep
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let slept = started.elapsed();
+        let Some(mut full) = open_world(&grid, 0, false) else {
+            return;
+        };
+        let started = Instant::now();
+        for pass in 0..2 {
+            full.step(pass % 2);
+        }
+        full.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let busy = started.elapsed();
+        eprintln!(
+            "timing settled 20 steps {slept:?}, full dispatch 2 steps {busy:?} ({:.1} ms/step vs {:.1} ms/step)",
+            slept.as_secs_f64() * 1000.0 / 20.0,
+            busy.as_secs_f64() * 1000.0 / 2.0
+        );
+    }
+
+    fn open_world(grid: &crate::grid::Grid, passes: u32, chunked: bool) -> Option<super::Gpu> {
+        let mut gpu = match pollster::block_on(super::Gpu::open(
+            None,
+            Size {
+                width: grid.width() as u32,
+                height: grid.height() as u32,
+            },
+            (grid.width() as u32, grid.height() as u32),
+        )) {
+            Ok(gpu) => gpu,
+            Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
+                panic!("GRAINS_REQUIRE_GPU=1 and no adapter was found: {err}")
+            }
+            Err(err) => {
+                eprintln!("chunk asserts skipped: {err}");
+                return None;
+            }
+        };
+        gpu.set_chunked(chunked);
+        gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
+        gpu.front = 0;
+        for pass in 0..passes {
+            gpu.step(pass % 2);
+        }
+        Some(gpu)
+    }
+
+    fn run_world(grid: &crate::grid::Grid, passes: u32, chunked: bool) -> Option<Vec<Cell>> {
+        open_world(grid, passes, chunked).map(|gpu| gpu.read_cells(gpu.front))
+    }
+
     fn play(grid: &crate::grid::Grid, passes: u32) -> Option<(Vec<Cell>, Vec<super::Speck>)> {
         let mut gpu = match pollster::block_on(super::Gpu::open(
             None,
@@ -2126,6 +2572,7 @@ mod tests {
                 width: 512,
                 height: 288,
             },
+            (512, 288),
         )) {
             Ok(gpu) => gpu,
             Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
