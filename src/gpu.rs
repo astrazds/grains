@@ -5,6 +5,8 @@ use winit::window::Window;
 
 use crate::grid::{CELL_COUNT, GRID_HEIGHT, GRID_WIDTH, Grid, LETTERBOX, Size, letterbox};
 
+const PASSES_PER_FRAME: u32 = 4;
+
 #[derive(Debug)]
 pub struct NoAdapter {
     names: Vec<String>,
@@ -23,10 +25,16 @@ pub(crate) struct Gpu {
     surface: Option<Surface>,
     window: Option<Arc<Window>>,
     size: Size,
-    cells: wgpu::Buffer,
+    cells: [wgpu::Buffer; 2],
+    front: usize,
+    passes: u32,
+    seeded: bool,
     uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    draw_groups: [wgpu::BindGroup; 2],
     pipeline: wgpu::RenderPipeline,
+    sim_uniform: wgpu::Buffer,
+    sim_groups: [wgpu::BindGroup; 2],
+    sim_pipeline: wgpu::ComputePipeline,
 }
 
 struct Surface {
@@ -48,6 +56,17 @@ struct Uniforms {
 }
 
 const _: () = assert!(std::mem::size_of::<Uniforms>() == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SimUniform {
+    offset: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<SimUniform>() == 16);
 
 pub(crate) fn wait(future: impl Future<Output = ()> + 'static) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -143,7 +162,9 @@ impl Gpu {
         for adapter in adapters {
             names.push(adapter.get_info().name);
             let flags = adapter.get_downlevel_capabilities().flags;
-            if !flags.contains(wgpu::DownlevelFlags::FRAGMENT_STORAGE) {
+            if !flags.contains(
+                wgpu::DownlevelFlags::FRAGMENT_STORAGE | wgpu::DownlevelFlags::COMPUTE_SHADERS,
+            ) {
                 continue;
             }
             let format = if let Some(surface) = &surface {
@@ -175,7 +196,7 @@ impl Gpu {
             return Err(NoAdapter { names });
         };
 
-        let (cells, uniform, bind_group, pipeline) = resources(&device, format);
+        let gpu_parts = resources(&device, format);
         let surface = surface.map(|surface| {
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -201,10 +222,16 @@ impl Gpu {
             surface,
             window,
             size,
-            cells,
-            uniform,
-            bind_group,
-            pipeline,
+            cells: gpu_parts.cells,
+            front: 0,
+            passes: 0,
+            seeded: false,
+            uniform: gpu_parts.uniform,
+            draw_groups: gpu_parts.draw_groups,
+            pipeline: gpu_parts.pipeline,
+            sim_uniform: gpu_parts.sim_uniform,
+            sim_groups: gpu_parts.sim_groups,
+            sim_pipeline: gpu_parts.sim_pipeline,
         })
     }
 
@@ -231,12 +258,22 @@ impl Gpu {
         self.reconfigure();
     }
 
-    fn paint(&self, texture: &wgpu::Texture, grid: &Grid) {
+    fn paint(&mut self, texture: &wgpu::Texture, grid: &Grid) {
+        if !self.seeded {
+            self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
+            self.front = 0;
+            self.seeded = true;
+        }
+        for _ in 0..PASSES_PER_FRAME {
+            let offset = self.passes % 2;
+            self.step(offset);
+            self.passes += 1;
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.encode(&mut encoder, &view, grid, self.size);
+        self.draw_cells(&mut encoder, &view, self.size, self.front);
         self.queue.submit([encoder.finish()]);
     }
 
@@ -260,7 +297,8 @@ impl Gpu {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.encode(&mut encoder, &view, grid, size);
+        self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
+        self.draw_cells(&mut encoder, &view, size, 0);
         let stride = padded_row_bytes(size.width);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -312,17 +350,152 @@ impl Gpu {
         pixels
     }
 
-    fn encode(
+    fn step(&mut self, offset: u32) {
+        let src = self.front;
+        let dst = src ^ 1;
+        let sim = SimUniform {
+            offset,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+        };
+        self.queue
+            .write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&sim));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let bytes = (CELL_COUNT * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.cells[src], 0, &self.cells[dst], 0, bytes);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.sim_pipeline);
+            pass.set_bind_group(0, &self.sim_groups[src], &[]);
+            let (groups_x, groups_y) = workgroups(offset);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.front = dst;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview(grid: &Grid, passes: u32, size: Size) -> Result<Vec<u8>, NoAdapter> {
+        let mut gpu = pollster::block_on(Self::open(None, size))?;
+        gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
+        for pass in 0..passes {
+            gpu.step(pass % 2);
+        }
+        Ok(gpu.read_rgba_from(gpu.front, size))
+    }
+
+    #[cfg(test)]
+    fn read_rgba_from(&self, index: usize, size: Size) -> Vec<u8> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.draw_cells(&mut encoder, &view, size, index);
+        let stride = padded_row_bytes(size.width);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(stride) * u64::from(size.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(size.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let mapped = map_buffer(&self.device, &buffer);
+        let row = (size.width * 4) as usize;
+        let stride = stride as usize;
+        let mut pixels = Vec::with_capacity(row * size.height as usize);
+        for y in 0..size.height as usize {
+            let start = y * stride;
+            pixels.extend_from_slice(&mapped[start..start + row]);
+        }
+        pixels
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate(grid: &Grid, passes: u32) -> Result<Vec<crate::grid::Cell>, NoAdapter> {
+        let gpu = pollster::block_on(Self::open(
+            None,
+            Size {
+                width: GRID_WIDTH as u32,
+                height: GRID_HEIGHT as u32,
+            },
+        ))?;
+        gpu.queue.write_buffer(&gpu.cells[0], 0, grid.as_bytes());
+        let mut gpu = gpu;
+        for pass in 0..passes {
+            gpu.step(pass % 2);
+        }
+        Ok(gpu.read_cells(gpu.front))
+    }
+
+    #[cfg(test)]
+    fn read_cells(&self, index: usize) -> Vec<crate::grid::Cell> {
+        let bytes = (CELL_COUNT * 4) as u64;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&self.cells[index], 0, &buffer, 0, bytes);
+        self.queue.submit([encoder.finish()]);
+        let mapped = map_buffer(&self.device, &buffer);
+        bytemuck::cast_slice(&mapped).to_vec()
+    }
+
+    fn draw_cells(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        grid: &Grid,
         size: Size,
+        index: usize,
     ) {
         let Some(fit) = letterbox(size) else {
             return;
         };
-        self.queue.write_buffer(&self.cells, 0, grid.as_bytes());
         let uniforms = Uniforms {
             origin_x: fit.origin_x,
             origin_y: fit.origin_y,
@@ -355,30 +528,42 @@ impl Gpu {
             return;
         };
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(0, &self.draw_groups[index], &[]);
         pass.set_viewport(x, y, width, height, 0.0, 1.0);
         pass.draw(0..3, 0..1);
     }
 }
 
-fn resources(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-) -> (
-    wgpu::Buffer,
-    wgpu::Buffer,
-    wgpu::BindGroup,
-    wgpu::RenderPipeline,
-) {
-    let cells = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (CELL_COUNT * 4) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+struct Parts {
+    cells: [wgpu::Buffer; 2],
+    uniform: wgpu::Buffer,
+    draw_groups: [wgpu::BindGroup; 2],
+    pipeline: wgpu::RenderPipeline,
+    sim_uniform: wgpu::Buffer,
+    sim_groups: [wgpu::BindGroup; 2],
+    sim_pipeline: wgpu::ComputePipeline,
+}
+
+fn resources(device: &wgpu::Device, format: wgpu::TextureFormat) -> Parts {
+    let usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let cells = [0, 1].map(|_| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (CELL_COUNT * 4) as u64,
+            usage,
+            mapped_at_creation: false,
+        })
     });
     let uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 32,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let sim_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -407,27 +592,29 @@ fn resources(
             },
         ],
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &cells,
-                    offset: 0,
-                    size: None,
-                }),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &uniform,
-                    offset: 0,
-                    size: None,
-                }),
-            },
-        ],
+    let draw_groups = [0, 1].map(|index| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &cells[index],
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &uniform,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        })
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -467,7 +654,123 @@ fn resources(
         multiview_mask: None,
         cache: None,
     });
-    (cells, uniform, bind_group, pipeline)
+    let sim_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let sim_groups = [0, 1].map(|index| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &sim_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &cells[index],
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &cells[index ^ 1],
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &sim_uniform,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        })
+    });
+    let sim_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sim.wgsl").into()),
+    });
+    let sim_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&sim_layout)],
+        immediate_size: 0,
+    });
+    let sim_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&sim_pipeline_layout),
+        module: &sim_shader,
+        entry_point: Some("step"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Parts {
+        cells,
+        uniform,
+        draw_groups,
+        pipeline,
+        sim_uniform,
+        sim_groups,
+        sim_pipeline,
+    }
+}
+
+fn workgroups(offset: u32) -> (u32, u32) {
+    let blocks_x = (GRID_WIDTH as u32 - offset) / 2;
+    let blocks_y = (GRID_HEIGHT as u32 - offset) / 2;
+    (blocks_x.div_ceil(8), blocks_y.div_ceil(8))
+}
+
+#[cfg(test)]
+fn map_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<u8> {
+    let slice = buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    receiver.recv().expect("map callback").expect("map buffer");
+    let mapped = slice.get_mapped_range().expect("mapped range");
+    let bytes = mapped.to_vec();
+    drop(mapped);
+    buffer.unmap();
+    bytes
 }
 
 fn pick_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
@@ -538,7 +841,7 @@ mod tests {
         let grid = crate::grid::Grid::from_fn(|x, y| match (x, y) {
             (0, 0) => Cell::pack(0x10, 0x20, 0x30, 0x40),
             (1, 0) => Cell::pack(0, 0, 0, 0),
-            (56, 44) => Cell::pack(0x01, 0x02, 0x03, 0x04),
+            (56, 44) => Cell::pack(0x07, 0x02, 0x03, 0x04),
             (56, 45) => Cell::pack(0x10, 0x20, 0x30, 0x00),
             _ => Cell::pack(0, 0, 0, 0),
         });
@@ -601,11 +904,11 @@ mod tests {
         };
         assert_eq!(frame.len(), 400 * 200 * 4);
         eprintln!("asserted 400x200 byte length = {}", frame.len());
-        asserted(400, 200, &frame, 0, 0, [0x01, 0x02, 0x03, 0xFF]);
+        asserted(400, 200, &frame, 0, 0, [0x07, 0x02, 0x03, 0xFF]);
         asserted(400, 200, &frame, 0, 1, [0x10, 0x20, 0x30, 0xFF]);
     }
 
-    fn colours(result: Result<Vec<u8>, crate::NoAdapter>) -> Option<Vec<u8>> {
+    fn colours<T>(result: Result<T, crate::NoAdapter>) -> Option<T> {
         match result {
             Ok(frame) => Some(frame),
             Err(err) if gpu_required(std::env::var("GRAINS_REQUIRE_GPU").ok().as_deref()) => {
@@ -622,6 +925,102 @@ mod tests {
         let got = pixel(frame, width, x, y);
         assert_eq!(got, expect);
         eprintln!("asserted {width}x{height} pixel ({x},{y}) = {got:?}");
+    }
+
+    #[test]
+    #[ignore = "writes frames under target/sand-frames"]
+    fn capture_sand_frames() {
+        let grid = crate::grid::Grid::demo();
+        let size = Size {
+            width: 512,
+            height: 288,
+        };
+        let dir = std::path::Path::new("target/sand-frames");
+        std::fs::create_dir_all(dir).unwrap();
+        for (frame, passes) in [0, 4, 8, 12, 16, 24, 32, 48].into_iter().enumerate() {
+            let pixels = super::Gpu::preview(&grid, passes, size).expect("preview");
+            let path = dir.join(format!("frame-{frame:02}.ppm"));
+            let mut ppm = format!("P6\n{} {}\n255\n", size.width, size.height).into_bytes();
+            for px in pixels.chunks(4) {
+                ppm.extend_from_slice(&px[..3]);
+            }
+            std::fs::write(path, ppm).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_grain_falls_to_the_floor() {
+        use crate::grid::{EMPTY, SAND};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(8, 280, Cell::pack(SAND, 0, 0, 0));
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 7)) else {
+            return;
+        };
+        assert_eq!(material_at(&cells, 8, 287), SAND);
+        assert_eq!(material_at(&cells, 8, 280), EMPTY);
+        assert_eq!(sand_count(&cells), 1);
+        eprintln!("asserted one sand grain at (8,287) after 7 passes");
+    }
+
+    #[test]
+    fn sand_does_not_pass_through_stone() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        for x in 0..crate::grid::GRID_WIDTH {
+            grid.set(x, 284, Cell::pack(STONE, 0, 0, 0));
+        }
+        for x in 8..12 {
+            grid.set(x, 280, Cell::pack(SAND, 0, 0, 0));
+        }
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 24)) else {
+            return;
+        };
+        assert_eq!(sand_count(&cells), 4);
+        for x in 0..crate::grid::GRID_WIDTH {
+            assert_eq!(material_at(&cells, x, 284), STONE, "stone at {x}");
+            for y in 285..crate::grid::GRID_HEIGHT {
+                assert_ne!(material_at(&cells, x, y), SAND, "sand at ({x},{y})");
+            }
+        }
+        eprintln!("asserted 4 sand grains stayed above the stone row");
+    }
+
+    #[test]
+    fn sand_count_is_conserved() {
+        let grid = crate::grid::Grid::demo();
+        let before = grid.sand_count();
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 16)) else {
+            return;
+        };
+        assert_eq!(sand_count(&cells), before);
+        eprintln!("asserted sand count {before} after 16 passes");
+    }
+
+    #[test]
+    fn sand_slides_beside_stone() {
+        use crate::grid::{EMPTY, SAND, STONE};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(8, 10, Cell::pack(SAND, 0, 0, 0));
+        grid.set(8, 11, Cell::pack(STONE, 0, 0, 0));
+        let Some(cells) = colours(super::Gpu::simulate(&grid, 1)) else {
+            return;
+        };
+        assert_eq!(material_at(&cells, 8, 11), STONE);
+        assert_eq!(material_at(&cells, 8, 10), EMPTY);
+        assert_eq!(material_at(&cells, 9, 11), SAND);
+        assert_eq!(sand_count(&cells), 1);
+        eprintln!("asserted sand slid from (8,10) to (9,11)");
+    }
+
+    fn material_at(cells: &[Cell], x: usize, y: usize) -> u8 {
+        cells[y * crate::grid::GRID_WIDTH + x].material()
+    }
+
+    fn sand_count(cells: &[Cell]) -> usize {
+        cells
+            .iter()
+            .filter(|cell| cell.material() == crate::grid::SAND)
+            .count()
     }
 
     #[test]

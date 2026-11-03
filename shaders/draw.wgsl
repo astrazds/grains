@@ -49,5 +49,11 @@ fn fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let variation = (word >> VARIATION_SHIFT) & 0xffu;
     let life = (word >> LIFE_SHIFT) & 0xffu;
     let _flags = (word >> FLAGS_SHIFT) & 0xffu;
+    if (material == 1u) {
+        return vec4<f32>(0.86, 0.72, 0.38, 1.0);
+    }
+    if (material == 2u) {
+        return vec4<f32>(0.45, 0.47, 0.50, 1.0);
+    }
     return vec4<f32>(f32(material) / 255.0, f32(variation) / 255.0, f32(life) / 255.0, 1.0);
 }

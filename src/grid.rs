@@ -9,6 +9,10 @@ pub(crate) const FLAGS_SHIFT: u32 = 24;
 
 pub const LETTERBOX: [u8; 4] = [20, 20, 23, 255];
 
+pub const EMPTY: u8 = 0;
+pub const SAND: u8 = 1;
+pub const STONE: u8 = 2;
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Cell(u32);
@@ -90,17 +94,23 @@ impl Grid {
         }
     }
 
-    pub fn random() -> Self {
-        let mut state = 0x6A09_E667_u32;
-        Self::from_fn(|_x, _y| {
-            let bits = xorshift32(&mut state);
-            Cell::pack(
-                bits as u8,
-                (bits >> 8) as u8,
-                (bits >> 16) as u8,
-                (bits >> 24) as u8,
-            )
+    pub fn demo() -> Self {
+        Self::from_fn(|x, y| {
+            if y == GRID_HEIGHT - 1 || ledge(x, y) {
+                Cell::pack(STONE, 0, 0, 0)
+            } else if sand_pile(x, y) {
+                Cell::pack(SAND, 0, 0, 0)
+            } else {
+                Cell::pack(EMPTY, 0, 0, 0)
+            }
         })
+    }
+
+    pub fn sand_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|cell| cell.material() == SAND)
+            .count()
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Cell {
@@ -132,13 +142,15 @@ fn heap_cells(cells: Vec<Cell>) -> Box<[Cell; CELL_COUNT]> {
         .unwrap_or_else(|_| panic!("grid length is not {CELL_COUNT}"))
 }
 
-fn xorshift32(state: &mut u32) -> u32 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    x
+fn ledge(x: usize, y: usize) -> bool {
+    (y == 210 && (40..230).contains(&x))
+        || (y == 150 && (270..470).contains(&x))
+        || (y == 96 && (100..210).contains(&x))
+}
+
+fn sand_pile(x: usize, y: usize) -> bool {
+    ((130..180).contains(&x) && (24..64).contains(&y))
+        || ((240..280).contains(&x) && (36..96).contains(&y))
 }
 
 #[cfg(test)]

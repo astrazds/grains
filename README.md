@@ -1,6 +1,6 @@
 # grains
 
-grains is a GPU falling-sand sandbox. The same frame runs in a native window and in the browser on WebGPU.
+grains is a GPU falling-sand sandbox. The same frame runs in a native window and in the browser on WebGPU. On launch, a pile of sand falls onto stone ledges.
 
 ## Run the native window
 
@@ -11,7 +11,7 @@ mise install
 cargo run
 ```
 
-The window title is grains. The inner size is 1024 by 600 physical pixels.
+The window title is grains. The inner size is 1024 by 600 physical pixels. Each frame runs four Margolus passes, alternating the 2x2 offset, so the sand keeps moving.
 
 ## Build the web page
 
@@ -32,10 +32,8 @@ GitHub Pages deploys from `main` only after the repo's Pages source is set to Gi
 
 ## Roadmap
 
-3. Ping-pong storage and a compute pass that copies the grid.
-4. Margolus 2x2 blocks with an alternating offset.
-5. Material rules for sand, water, and stone.
-6. A brush compute pass.
-7. A colourize pass that replaces the debug RGB with a palette.
-8. Bloom: bright pass, separable blur, composite.
-9. An egui overlay for the material picker.
+4. Water, and a few more materials.
+5. A brush compute pass.
+6. A colourize pass that replaces the debug colours with a palette.
+7. Bloom: bright pass, separable blur, composite.
+8. An egui overlay for the material picker.
