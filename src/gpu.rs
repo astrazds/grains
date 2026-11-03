@@ -60,9 +60,9 @@ struct Uniforms {
     scale: u32,
     grid_width: u32,
     grid_height: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    frame_width: u32,
+    frame_height: u32,
+    _pad: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<Uniforms>() == 32);
@@ -376,10 +376,9 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         if bloom {
-            self.draw_bloom(&mut encoder, texture, index);
+            self.draw_bloom(&mut encoder, texture, index, true);
         } else {
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.draw_cells(&mut encoder, &view, self.size, index);
+            self.draw_bloom(&mut encoder, texture, index, false);
         }
         self.queue.submit([encoder.finish()]);
     }
@@ -452,16 +451,11 @@ impl Gpu {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.queue.write_buffer(&self.cells[0], 0, grid.as_bytes());
-        if bloom {
-            self.draw_bloom(&mut encoder, &texture, 0);
-        } else {
-            self.draw_cells(&mut encoder, &view, size, 0);
-        }
+        self.draw_bloom(&mut encoder, &texture, 0, bloom);
         let rgba = stage_copy(&self.device, &mut encoder, &texture, size, 4);
         let linear = bloom.then(|| {
             let lit = &self.bloom.as_ref().unwrap().lit;
@@ -536,7 +530,7 @@ impl Gpu {
     }
 
     #[cfg(test)]
-    fn read_rgba_from(&self, index: usize, size: Size) -> Vec<u8> {
+    fn read_rgba_from(&mut self, index: usize, size: Size) -> Vec<u8> {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -551,11 +545,10 @@ impl Gpu {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.draw_cells(&mut encoder, &view, size, index);
+        self.draw_bloom(&mut encoder, &texture, index, true);
         let stride = padded_row_bytes(size.width, 4);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -646,38 +639,15 @@ impl Gpu {
         bytemuck::cast_slice(&mapped).to_vec()
     }
 
-    fn draw_cells(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
-        size: Size,
-        index: usize,
-    ) {
-        let Some((x, y, width, height)) = self.prepare_frame(size) else {
-            return;
-        };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(color_attachment(view, letterbox_color()))],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.draw_groups[index], &[]);
-        pass.set_viewport(x, y, width, height, 0.0, 1.0);
-        pass.draw(0..3, 0..1);
-    }
-
     fn draw_bloom(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::Texture,
         index: usize,
+        bloom: bool,
     ) {
         self.ensure_bloom();
-        let Some((x, y, width, height)) = self.prepare_frame(self.size) else {
+        let Some(_) = self.prepare_frame(self.size) else {
             return;
         };
         let hdr_view = self
@@ -707,30 +677,36 @@ impl Gpu {
             });
             pass.set_pipeline(&bloom.grid);
             pass.set_bind_group(0, &self.draw_groups[index], &[]);
-            pass.set_viewport(x, y, width, height, 0.0, 1.0);
             pass.draw(0..3, 0..1);
         }
-        // Quarter-res bright pass, horizontal blur, vertical blur, composite, then the swapchain blit.
-        self.bloom_pass(
-            encoder,
-            Stage::Bright,
-            &self.bloom.as_ref().unwrap().low_view[0],
-        );
-        self.bloom_pass(
-            encoder,
-            Stage::BlurX,
-            &self.bloom.as_ref().unwrap().low_view[1],
-        );
-        self.bloom_pass(
-            encoder,
-            Stage::BlurY,
-            &self.bloom.as_ref().unwrap().low_view[0],
-        );
-        self.bloom_pass(
-            encoder,
-            Stage::Composite,
-            &self.bloom.as_ref().unwrap().lit_view,
-        );
+        if bloom {
+            self.bloom_pass(
+                encoder,
+                Stage::Bright,
+                &self.bloom.as_ref().unwrap().low_view[0],
+            );
+            self.bloom_pass(
+                encoder,
+                Stage::BlurX,
+                &self.bloom.as_ref().unwrap().low_view[1],
+            );
+            self.bloom_pass(
+                encoder,
+                Stage::BlurY,
+                &self.bloom.as_ref().unwrap().low_view[0],
+            );
+            self.bloom_pass(
+                encoder,
+                Stage::Composite,
+                &self.bloom.as_ref().unwrap().lit_view,
+            );
+        } else {
+            self.bloom_pass(
+                encoder,
+                Stage::Plain,
+                &self.bloom.as_ref().unwrap().lit_view,
+            );
+        }
         let target_view = target.create_view(&Default::default());
         self.bloom_pass(encoder, Stage::Blit, &target_view);
     }
@@ -747,6 +723,7 @@ impl Gpu {
             Stage::BlurX => (&bloom.blur_x, &bloom.blur_from[0]),
             Stage::BlurY => (&bloom.blur_y, &bloom.blur_from[1]),
             Stage::Composite => (&bloom.composite, &bloom.composite_group),
+            Stage::Plain => (&bloom.composite, &bloom.plain_group),
             Stage::Blit => (&bloom.blit, &bloom.blit_group),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -770,9 +747,9 @@ impl Gpu {
             scale: fit.scale,
             grid_width: GRID_WIDTH as u32,
             grid_height: GRID_HEIGHT as u32,
-            pad0: 0,
-            pad1: 0,
-            pad2: 0,
+            frame_width: size.width,
+            frame_height: size.height,
+            _pad: 0,
         };
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniforms));
@@ -789,6 +766,28 @@ impl Gpu {
         }
         let layout = self.pipeline.get_bind_group_layout(0);
         self.bloom = Some(bloom_targets(&self.device, self.format, &layout, self.size));
+        self.clear_black();
+    }
+
+    fn clear_black(&self) {
+        let Some(bloom) = &self.bloom else {
+            return;
+        };
+        let view = bloom.black.create_view(&Default::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(color_attachment(&view, wgpu::Color::TRANSPARENT))],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
     }
 }
 
@@ -1226,6 +1225,7 @@ enum Stage {
     BlurX,
     BlurY,
     Composite,
+    Plain,
     Blit,
 }
 
@@ -1240,6 +1240,7 @@ struct BloomTargets {
     bright_group: wgpu::BindGroup,
     blur_from: [wgpu::BindGroup; 2],
     composite_group: wgpu::BindGroup,
+    plain_group: wgpu::BindGroup,
     blit_group: wgpu::BindGroup,
     // Groups borrow the views, and the views borrow the textures.
     #[allow(dead_code)]
@@ -1256,6 +1257,9 @@ struct BloomTargets {
     low: [wgpu::Texture; 2],
     #[allow(dead_code)]
     sampler: wgpu::Sampler,
+    // Sampled when bloom is off so the tonemap matches the bloom path.
+    #[allow(dead_code)]
+    black: wgpu::Texture,
     // Native frame readback copies this. The window only samples the view.
     #[allow(dead_code)]
     lit: wgpu::Texture,
@@ -1276,6 +1280,7 @@ fn bloom_targets(
         float_target(device, low_w, low_h, false),
     ];
     let lit = float_target(device, frame.width, frame.height, true);
+    let black = float_target(device, 1, 1, false);
     let hdr_view = hdr.create_view(&Default::default());
     let glow_view = glow.create_view(&Default::default());
     let low_view = [
@@ -1283,6 +1288,7 @@ fn bloom_targets(
         low[1].create_view(&Default::default()),
     ];
     let lit_view = lit.create_view(&Default::default());
+    let black_view = black.create_view(&Default::default());
     let draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/draw.wgsl").into()),
@@ -1355,6 +1361,18 @@ fn bloom_targets(
                 },
             ],
         }),
+        plain_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &composite_layout,
+            entries: &[
+                texture_binding(0, &hdr_view),
+                texture_binding(1, &black_view),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        }),
         blit_group: texture_group(device, &tex_layout, &lit_view),
         grid,
         bright: fullscreen_pipeline(device, &bloom_shader, "bright", &tex_pipeline, float_format),
@@ -1376,6 +1394,7 @@ fn bloom_targets(
         glow,
         low,
         sampler,
+        black,
         lit,
     }
 }
@@ -1663,7 +1682,11 @@ mod tests {
             return;
         };
         asserted(512, 288, &frame, 0, 0, [0x10, 0x20, 0x30, 0xFF]);
-        asserted(512, 288, &frame, 1, 0, [0x00, 0x00, 0x00, 0xFF]);
+        assert_ne!(
+            pixel(&frame, 512, 1, 0),
+            pixel(&frame, 512, 400, 200),
+            "empty background is flat"
+        );
 
         let Some(frame) = colours(crate::render_rgba(
             &grid,
@@ -1674,8 +1697,11 @@ mod tests {
         )) else {
             return;
         };
-        asserted(1024, 600, &frame, 0, 0, [20, 20, 23, 255]);
-        asserted(1024, 600, &frame, 0, 11, [20, 20, 23, 255]);
+        assert_ne!(
+            pixel(&frame, 1024, 0, 0),
+            pixel(&frame, 1024, 1023, 599),
+            "letterbox is flat"
+        );
         asserted(1024, 600, &frame, 0, 12, [0x10, 0x20, 0x30, 0xFF]);
 
         let Some(frame) = colours(crate::render_rgba(
@@ -2224,10 +2250,19 @@ mod tests {
         };
         let dark = pixel(&off.rgba, size.width, 9, 8);
         let lit = pixel(&on.rgba, size.width, 9, 8);
-        assert_eq!(dark, [0, 0, 0, 255]);
-        assert!(lit[0] > 13, "glow stayed as faint as the old halo {lit:?}");
-        assert!(lit[0] < 80, "glow flooded the neighbour {lit:?}");
-        assert_eq!(pixel(&on.rgba, size.width, 200, 200), [0, 0, 0, 255]);
+        assert!(
+            lit[0] >= dark[0] + 12,
+            "fire did not glow over the background, off {dark:?} on {lit:?}"
+        );
+        assert!(
+            lit[0] < dark[0] + 36,
+            "glow washed out the neighbour, off {dark:?} on {lit:?}"
+        );
+        assert_eq!(
+            pixel(&on.rgba, size.width, 200, 200),
+            pixel(&off.rgba, size.width, 200, 200),
+            "bloom reached a distant empty cell"
+        );
         assert_finite(&on.linear);
         eprintln!("asserted the pixel beside fire rose from {dark:?} to {lit:?}");
 
@@ -2253,6 +2288,58 @@ mod tests {
             let exponent = (bits >> 10) & 0x1f;
             assert_ne!(exponent, 0x1f, "non-finite texel {index}");
         }
+    }
+
+    #[test]
+    fn sand_varies_fire_ages_and_the_background_is_graded() {
+        use crate::grid::{EMPTY, FIRE, SAND};
+        let mut grid = crate::grid::Grid::from_fn(|_, _| Cell::pack(EMPTY, 0, 0, 0));
+        grid.set(8, 8, Cell::pack(SAND, 0, 0, 0));
+        grid.set(12, 8, Cell::pack(SAND, 255, 0, 0));
+        grid.set(30, 40, Cell::pack(SAND, 40, 0, 0));
+        grid.set(80, 90, Cell::pack(SAND, 40, 0, 0));
+        grid.set(20, 8, Cell::pack(FIRE, 0, 255, 0));
+        grid.set(28, 8, Cell::pack(FIRE, 0, 12, 0));
+        let size = Size {
+            width: crate::grid::GRID_WIDTH as u32,
+            height: crate::grid::GRID_HEIGHT as u32,
+        };
+        let Some(frame) = colours(super::Gpu::render_scene(&grid, size, false)) else {
+            return;
+        };
+        let dull = pixel(&frame.rgba, size.width, 8, 8);
+        let bright = pixel(&frame.rgba, size.width, 12, 8);
+        assert_ne!(dull, bright, "sand variation did not change the colour");
+        assert!(
+            bright[0] > dull[0],
+            "brighter grain was not lighter {dull:?} {bright:?}"
+        );
+        assert_eq!(
+            pixel(&frame.rgba, size.width, 30, 40),
+            pixel(&frame.rgba, size.width, 80, 90),
+            "the same variation byte painted two different sands"
+        );
+        let young = pixel(&frame.rgba, size.width, 20, 8);
+        let old = pixel(&frame.rgba, size.width, 28, 8);
+        assert!(
+            young[1] > old[1] + 15,
+            "young fire {young:?} was not yellower than old fire {old:?}"
+        );
+        assert!(
+            young[2] > old[2],
+            "young fire {young:?} lost its yellow before the old ember {old:?}"
+        );
+        assert!(old[0] > old[1], "old fire {old:?} was not red");
+        let sky_a = pixel(&frame.rgba, size.width, 8, 40);
+        let sky_b = pixel(&frame.rgba, size.width, 400, 200);
+        assert_ne!(sky_a, sky_b, "empty background is flat {sky_a:?}");
+        let Some(lit) = colours(super::Gpu::render_scene(&grid, size, true)) else {
+            return;
+        };
+        assert_finite(&lit.linear);
+        eprintln!(
+            "asserted sand {dull:?}/{bright:?}, fire {young:?} to {old:?}, sky {sky_a:?} to {sky_b:?}"
+        );
     }
 
     #[test]

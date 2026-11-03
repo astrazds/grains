@@ -11,7 +11,7 @@ mise install
 cargo run
 ```
 
-The window title is grains. The inner size is 1024 by 600 physical pixels. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Wood next to fire burns. Fire rises a little, glows, and leaves smoke. Water puts fire out and becomes steam, and steam rises until it condenses.
+The window title is grains. The inner size is 1024 by 600 physical pixels. Each frame runs several Margolus passes. Sand sinks through water and oil, oil floats on water, and a falling liquid stays in a column until it lands. Smoke rises on two passes out of four, drifts sideways, and fades. Sand, stone, and wood pick up grain from the colour byte on each cell. Fire shifts from yellow-white to deep red as it burns. Water and oil stay a little translucent, and smoke fades into the background.
 
 ## Controls
 

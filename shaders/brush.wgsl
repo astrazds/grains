@@ -47,5 +47,11 @@ fn paint(@builtin(global_invocation_id) id: vec3<u32>) {
     if (brush.erase == 0u && (cells[index] & 0xffu) == STONE) {
         return;
     }
-    cells[index] = select(brush.material, 0u, brush.erase != 0u);
+    let painted = (brush.material & 0xffff00ffu) | (grain_of(id.x, id.y) << 8u);
+    cells[index] = select(painted, 0u, brush.erase != 0u);
+}
+
+fn grain_of(x: u32, y: u32) -> u32 {
+    let mixed = x * 374761393u ^ y * 668265263u;
+    return (mixed >> 16u) & 0xffu;
 }

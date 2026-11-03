@@ -27,6 +27,12 @@ pub const KIND_POWDER: u32 = 2;
 pub const KIND_LIQUID: u32 = 3;
 pub const KIND_GAS: u32 = 4;
 
+pub const STYLE_VOID: u32 = 0;
+pub const STYLE_GRAIN: u32 = 1;
+pub const STYLE_LIQUID: u32 = 2;
+pub const STYLE_FIRE: u32 = 3;
+pub const STYLE_GAS: u32 = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialInfo {
@@ -36,11 +42,12 @@ pub struct MaterialInfo {
     pub becomes: u32,
     pub colour: [f32; 4],
     pub emissive: f32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    pub grain: f32,
+    pub style: u32,
+    _pad: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 const fn info(
     density: u32,
     kind: u32,
@@ -48,6 +55,8 @@ const fn info(
     becomes: u32,
     colour: [f32; 4],
     emissive: f32,
+    grain: f32,
+    style: u32,
 ) -> MaterialInfo {
     MaterialInfo {
         density,
@@ -56,14 +65,23 @@ const fn info(
         becomes,
         colour,
         emissive,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
+        grain,
+        style,
+        _pad: 0,
     }
 }
 
 pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
-    info(0, KIND_EMPTY, 0, EMPTY as u32, [0.0, 0.0, 0.0, 1.0], 0.0),
+    info(
+        0,
+        KIND_EMPTY,
+        0,
+        EMPTY as u32,
+        [0.0, 0.0, 0.0, 1.0],
+        0.0,
+        0.0,
+        STYLE_VOID,
+    ),
     info(
         4,
         KIND_POWDER,
@@ -71,8 +89,19 @@ pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
         EMPTY as u32,
         [0.86, 0.72, 0.38, 1.0],
         0.0,
+        0.45,
+        STYLE_GRAIN,
     ),
-    info(5, KIND_SOLID, 0, EMPTY as u32, [0.45, 0.47, 0.50, 1.0], 0.0),
+    info(
+        5,
+        KIND_SOLID,
+        0,
+        EMPTY as u32,
+        [0.45, 0.47, 0.50, 1.0],
+        0.0,
+        0.18,
+        STYLE_GRAIN,
+    ),
     info(
         3,
         KIND_LIQUID,
@@ -80,6 +109,8 @@ pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
         EMPTY as u32,
         [0.25, 0.45, 0.85, 1.0],
         0.0,
+        0.22,
+        STYLE_LIQUID,
     ),
     info(
         2,
@@ -88,11 +119,49 @@ pub static MATERIALS: [MaterialInfo; MATERIAL_COUNT] = [
         EMPTY as u32,
         [0.55, 0.35, 0.12, 1.0],
         0.0,
+        0.16,
+        STYLE_LIQUID,
     ),
-    info(1, KIND_GAS, 255, EMPTY as u32, [0.75, 0.75, 0.78, 1.0], 0.0),
-    info(5, KIND_SOLID, 0, EMPTY as u32, [0.42, 0.26, 0.12, 1.0], 0.0),
-    info(1, KIND_GAS, 24, SMOKE as u32, [0.95, 0.35, 0.08, 1.0], 12.0),
-    info(1, KIND_GAS, 32, WATER as u32, [0.82, 0.88, 0.92, 1.0], 0.8),
+    info(
+        1,
+        KIND_GAS,
+        255,
+        EMPTY as u32,
+        [0.75, 0.75, 0.78, 1.0],
+        0.0,
+        0.0,
+        STYLE_GAS,
+    ),
+    info(
+        5,
+        KIND_SOLID,
+        0,
+        EMPTY as u32,
+        [0.42, 0.26, 0.12, 1.0],
+        0.0,
+        0.32,
+        STYLE_GRAIN,
+    ),
+    info(
+        1,
+        KIND_GAS,
+        24,
+        SMOKE as u32,
+        [0.95, 0.35, 0.08, 1.0],
+        8.0,
+        0.2,
+        STYLE_FIRE,
+    ),
+    info(
+        1,
+        KIND_GAS,
+        32,
+        WATER as u32,
+        [0.82, 0.88, 0.92, 1.0],
+        0.8,
+        0.0,
+        STYLE_GAS,
+    ),
 ];
 
 #[repr(C)]
@@ -126,6 +195,11 @@ const _: () = assert!(std::mem::size_of::<MaterialInfo>() == 48);
 
 pub fn material_info(id: u8) -> MaterialInfo {
     MATERIALS.get(id as usize).copied().unwrap_or(MATERIALS[0])
+}
+
+pub fn grain(x: usize, y: usize) -> u8 {
+    let mixed = (x as u32).wrapping_mul(374761393) ^ (y as u32).wrapping_mul(668265263);
+    (mixed >> 16) as u8
 }
 
 pub fn spawn_word(id: u8) -> u32 {
@@ -253,9 +327,9 @@ impl Grid {
     pub fn demo() -> Self {
         Self::from_fn(|x, y| {
             if y == GRID_HEIGHT - 1 || ledge(x, y) {
-                Cell::pack(STONE, 0, 0, 0)
+                Cell::pack(STONE, grain(x, y), 0, 0)
             } else if sand_pile(x, y) {
-                Cell::pack(SAND, 0, 0, 0)
+                Cell::pack(SAND, grain(x, y), 0, 0)
             } else {
                 Cell::pack(EMPTY, 0, 0, 0)
             }
@@ -353,7 +427,7 @@ mod tests {
         let sim = include_str!("../shaders/sim.wgsl");
         let draw = include_str!("../shaders/draw.wgsl");
         let count = format!("const MATERIAL_COUNT: u32 = {}u;", super::MATERIAL_COUNT);
-        let draw_count = format!("material < {}u", super::MATERIAL_COUNT);
+        let draw_count = format!("material >= {}u", super::MATERIAL_COUNT);
         assert!(sim.contains(&count), "{count}");
         assert!(draw.contains(&draw_count), "{draw_count}");
     }

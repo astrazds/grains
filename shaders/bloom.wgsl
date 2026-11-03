@@ -56,7 +56,20 @@ fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let size = vec2<f32>(textureDimensions(source));
     let uv = (position.xy + vec2<f32>(0.5)) / size;
     let glow = textureSample(bloom_tex, bloom_sampler, uv);
-    return vec4<f32>(base.rgb + glow.rgb, 1.0);
+    let lit = base.rgb + glow.rgb * 0.75;
+    if (base.a > 1.5) {
+        return vec4<f32>(clamp(base.rgb + glow.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
+    return vec4<f32>(aces_tonemap(lit), 1.0);
+}
+
+fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @fragment
