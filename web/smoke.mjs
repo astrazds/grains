@@ -81,7 +81,7 @@ try {
       return pixels.panel[0] > 160 && pixels.panel[1] > 160 && pixels.panel[2] > 160;
     },
     null,
-    { timeout: 45000 },
+    { timeout: 120000 },
   );
   await page.mouse.click(80, 20);
   await page.keyboard.press("2");

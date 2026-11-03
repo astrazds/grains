@@ -484,9 +484,8 @@ impl Gpu {
         self.finish_probe(probe, texture.clone());
     }
 
-    // `?probe=1` copies three canvas pixels into `window.grainsPixels` after
-    // the panel has had a few frames to upload its texture. Screenshots of a
-    // WebGPU canvas stay empty, so the smoke test reads these instead.
+    // `?probe=1` copies three canvas pixels into `window.grainsPixels`.
+    // Screenshots of a WebGPU canvas stay empty, so the smoke test reads these.
     #[cfg(target_arch = "wasm32")]
     fn record_probe(
         &self,
@@ -496,9 +495,10 @@ impl Gpu {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let frame = N.fetch_add(1, Ordering::Relaxed);
-        if !crate::web::probe() || frame < 8 || PROBE_BUSY.swap(true, Ordering::Relaxed) {
+        if !crate::web::probe() || frame < 2 || PROBE_BUSY.swap(true, Ordering::Relaxed) {
             return Vec::new();
         }
+        web_sys::console::log_1(&format!("probe copy {frame}").into());
         let spots = [
             (8u32, 8u32, "corner"),
             (120, 180, "panel"),
