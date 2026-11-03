@@ -123,9 +123,8 @@ impl Gpu {
             }
             wgpu::CurrentSurfaceTexture::Outdated => self.reconfigure(),
             wgpu::CurrentSurfaceTexture::Lost => self.recreate_surface(),
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => {}
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
+            wgpu::CurrentSurfaceTexture::Validation => panic!("surface validation"),
         }
     }
 
@@ -540,6 +539,7 @@ mod tests {
             (0, 0) => Cell::pack(0x10, 0x20, 0x30, 0x40),
             (1, 0) => Cell::pack(0, 0, 0, 0),
             (56, 44) => Cell::pack(0x01, 0x02, 0x03, 0x04),
+            (56, 45) => Cell::pack(0x10, 0x20, 0x30, 0x00),
             _ => Cell::pack(0, 0, 0, 0),
         });
         assert!(
@@ -611,7 +611,9 @@ mod tests {
                 return;
             }
         };
+        assert_eq!(frame.len(), 400 * 200 * 4);
         assert_eq!(pixel(&frame, 400, 0, 0), [0x01, 0x02, 0x03, 0xFF]);
+        assert_eq!(pixel(&frame, 400, 0, 1), [0x10, 0x20, 0x30, 0xFF]);
     }
 
     fn pixel(frame: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
