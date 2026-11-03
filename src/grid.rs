@@ -61,6 +61,27 @@ pub struct Fit {
     pub origin_y: i32,
 }
 
+pub fn cell_at(pixel_x: i32, pixel_y: i32, fit: Fit) -> Option<(u32, u32)> {
+    if fit.scale == 0 {
+        return None;
+    }
+    let local_x = pixel_x - fit.origin_x;
+    let local_y = pixel_y - fit.origin_y;
+    if local_x < 0 || local_y < 0 {
+        return None;
+    }
+    let cell_x = (local_x as u32) / fit.scale;
+    let cell_y = (local_y as u32) / fit.scale;
+    if cell_x >= GRID_WIDTH as u32 || cell_y >= GRID_HEIGHT as u32 {
+        return None;
+    }
+    Some((cell_x, cell_y))
+}
+
+pub fn physical_pixel(css: f64, ratio: f64) -> i32 {
+    (css * ratio).round() as i32
+}
+
 pub fn letterbox(size: Size) -> Option<Fit> {
     if size.width == 0 || size.height == 0 {
         return None;
@@ -155,7 +176,7 @@ fn sand_pile(x: usize, y: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, Size, letterbox};
+    use super::{Cell, Fit, Size, cell_at, letterbox, physical_pixel};
 
     #[test]
     fn pack_lays_out_the_word() {
@@ -189,6 +210,70 @@ mod tests {
                 height: 0
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn cell_at_follows_the_letterbox() {
+        let fit = letterbox(Size {
+            width: 1024,
+            height: 600,
+        })
+        .unwrap();
+        assert_eq!(fit.scale, 2);
+        assert_eq!((fit.origin_x, fit.origin_y), (0, 12));
+        assert_eq!(cell_at(0, 12, fit), Some((0, 0)));
+        assert_eq!(cell_at(1, 13, fit), Some((0, 0)));
+        assert_eq!(cell_at(2, 12, fit), Some((1, 0)));
+        assert_eq!(cell_at(1023, 587, fit), Some((511, 287)));
+        assert_eq!(cell_at(0, 11, fit), None);
+        assert_eq!(cell_at(1023, 588, fit), None);
+        assert_eq!(cell_at(-1, 12, fit), None);
+
+        let wide = letterbox(Size {
+            width: 1100,
+            height: 600,
+        })
+        .unwrap();
+        assert_eq!((wide.origin_x, wide.scale), (38, 2));
+        assert_eq!(cell_at(37, 12, wide), None);
+        assert_eq!(cell_at(38, 11, wide), None);
+        assert_eq!(cell_at(38, 12, wide), Some((0, 0)));
+        assert_eq!(cell_at(38 + 1023, 12 + 575, wide), Some((511, 287)));
+        assert_eq!(cell_at(38 + 1024, 12, wide), None);
+
+        let crop = letterbox(Size {
+            width: 400,
+            height: 200,
+        })
+        .unwrap();
+        assert_eq!((crop.origin_x, crop.origin_y, crop.scale), (-56, -44, 1));
+        assert_eq!(cell_at(0, 0, crop), Some((56, 44)));
+        assert_eq!(cell_at(399, 199, crop), Some((455, 243)));
+    }
+
+    #[test]
+    fn physical_pixel_scales_css_before_the_grid() {
+        let fit = Fit {
+            scale: 2,
+            origin_x: 0,
+            origin_y: 12,
+        };
+        let x = physical_pixel(1.0, 2.0);
+        let y = physical_pixel(6.0, 2.0);
+        assert_eq!((x, y), (2, 12));
+        assert_eq!(cell_at(x, y, fit), Some((1, 0)));
+        assert_eq!(
+            cell_at(physical_pixel(2.0, 1.0), physical_pixel(12.0, 1.0), fit),
+            Some((1, 0))
+        );
+        assert_eq!(
+            cell_at(physical_pixel(0.8, 2.5), physical_pixel(4.8, 2.5), fit),
+            Some((1, 0))
+        );
+        assert_eq!(
+            cell_at(physical_pixel(0.0, 2.0), physical_pixel(5.4, 2.0), fit),
+            None
         );
     }
 

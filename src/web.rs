@@ -32,5 +32,5 @@ pub fn physical_size(window: &winit::window::Window) -> crate::Size {
 }
 
 fn device_pixels(css_px: i32, ratio: f64) -> u32 {
-    (f64::from(css_px.max(0)) * ratio).round() as u32
+    crate::physical_pixel(f64::from(css_px.max(0)), ratio).max(0) as u32
 }
