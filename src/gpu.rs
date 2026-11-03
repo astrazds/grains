@@ -154,7 +154,7 @@ pub(crate) struct Paint {
     pub clear: bool,
     pub bloom: bool,
     pub passes: u32,
-    pub stroke: Option<Stroke>,
+    pub strokes: Vec<Stroke>,
 }
 
 pub(crate) fn wait(future: impl Future<Output = ()> + 'static) {
@@ -444,7 +444,7 @@ impl Gpu {
                 clear: 1,
             });
         }
-        if let Some(stroke) = input.stroke {
+        for &stroke in &input.strokes {
             self.apply_brush(stroke);
         }
         if input.paused {

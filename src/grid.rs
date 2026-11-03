@@ -316,9 +316,22 @@ impl Camera {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32, world_w: u32, world_h: u32, view_w: u32, view_h: u32) {
-        self.cell_x = (self.cell_x - dx / self.zoom).clamp(0.0, world_w as f32);
-        self.cell_y = (self.cell_y - dy / self.zoom).clamp(0.0, world_h as f32);
-        let _ = (view_w, view_h);
+        self.cell_x -= dx / self.zoom;
+        self.cell_y -= dy / self.zoom;
+        self.constrain(world_w, world_h, view_w, view_h);
+    }
+
+    pub fn constrain(&mut self, world_w: u32, world_h: u32, view_w: u32, view_h: u32) {
+        let limit = |origin: f32, world: u32, view: u32| {
+            let spare = world as f32 - view as f32 / self.zoom;
+            if spare < 0.0 {
+                spare * 0.5
+            } else {
+                origin.clamp(0.0, spare)
+            }
+        };
+        self.cell_x = limit(self.cell_x, world_w, view_w);
+        self.cell_y = limit(self.cell_y, world_h, view_h);
     }
 
     pub fn zoom_at(&mut self, cursor_x: f32, cursor_y: f32, factor: f32) {
@@ -643,6 +656,13 @@ mod tests {
     fn column_past_the_grid_does_not_alias_the_next_row() {
         let mut grid = super::Grid::filled(4, 2, |_, _| Cell::pack(0, 0, 0, 0));
         grid.set(4, 0, Cell::pack(super::STONE, 0, 0, 0));
+    }
+
+    #[test]
+    fn camera_pan_keeps_the_viewport_inside_the_world() {
+        let mut camera = super::Camera::centered(1024, 576, 512, 288);
+        camera.pan(-5000.0, -5000.0, 1024, 576, 512, 288);
+        assert_eq!((camera.cell_x, camera.cell_y), (512.0, 288.0));
     }
 
     #[test]
