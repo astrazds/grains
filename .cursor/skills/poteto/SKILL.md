@@ -24,6 +24,12 @@ On every task, read these skills and apply them strictly:
 - Author commits and pull requests as Andrejs. No bot signature. No agent footer.
 - Never merge your own pull request.
 
+## Rules and enforcers
+
+| Rule | Enforcer |
+| --- | --- |
+| A pull request body does not include a Cursor agent footer. | `.github/workflows/pr-body.yml` runs `node scripts/check-pr-body.mjs`. The check prints `Remove the footer.` |
+
 ## Safety
 
 - Never force-push or rewrite pushed history.

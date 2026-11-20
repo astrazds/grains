@@ -1,0 +1,26 @@
+name: Pull request body
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  body:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Test the pull request body check
+        run: node --test scripts/check-pr-body.test.mjs
+
+      - name: Reject an agent footer in the pull request body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+        run: node scripts/check-pr-body.mjs
