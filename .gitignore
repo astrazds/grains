@@ -1,2 +1,5 @@
 /target
 /dist
+.cursor/skills/verify-grains/.tools/
+.cursor/skills/verify-grains/run/
+.cursor/skills/verify-grains/evidence/
